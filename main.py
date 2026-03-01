@@ -5,10 +5,10 @@ import requests
 import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
 
-# 加載 .env 檔案
+# 加載環境變數 (GitHub Actions 會自動注入 Secrets)
 load_dotenv()
 
-# 配置區 (從 .env 讀取)
+# 配置區 (從 GitHub Secrets 讀取)
 META_USER_ACCESS_TOKEN = os.getenv("THREADS_ACCESS_TOKEN")
 THREADS_USER_ID = os.getenv("THREADS_USER_ID")
 LAST_ALERT_FILE = "last_alert.txt"
@@ -20,7 +20,7 @@ ALERT_MAP = {
 }
 
 def clean_text(s: str) -> str:
-    """徹底壓平文字，將換行符號替換為空格，確保不出現 \n\n"""
+    """徹底壓平文字，將換行符號替換為空格，確保不出現 \\n\\n"""
     if not s: return ""
     s = s.replace("\\n", " ").replace("\n", " ").replace("\r", " ")
     return re.sub(r"\s+", " ", s).strip()
@@ -41,25 +41,21 @@ def get_image_url(title, description):
         if keyword in title:
             return f"https://www.cwa.gov.tw/Data/warning/{code}_C.png"
     
-    # 預設回傳強風特報圖
+    # 預設圖片
     return "https://www.cwa.gov.tw/Data/warning/W25_C.png"
 
 def post_to_threads(text, image_url):
-    """Threads API 兩階段發布邏輯 (Container -> Publish)"""
+    """Threads API 兩階段發布邏輯"""
     base_url = "https://graph.threads.net/v1.0"
     auth = {"access_token": META_USER_ACCESS_TOKEN}
     
     try:
         # 第一階段：建立媒體容器
-        payload = {
-            "text": text,
-            "media_type": "IMAGE",
-            "image_url": image_url
-        }
+        payload = {"text": text, "media_type": "IMAGE", "image_url": image_url}
         res = requests.post(f"{base_url}/{THREADS_USER_ID}/threads", params=auth, data=payload, timeout=20)
         
         if res.status_code == 400:
-            print("\n⚠️ 偵測到 Token 已過期或無效！請更新 .env 檔案中的 THREADS_ACCESS_TOKEN。\n")
+            print(f"❌ Token 已失效：{res.text}")
             return False
             
         res.raise_for_status()
@@ -69,7 +65,7 @@ def post_to_threads(text, image_url):
         requests.post(f"{base_url}/{THREADS_USER_ID}/threads_publish", 
                       params=auth, data={"creation_id": creation_id}, timeout=20)
         
-        print(f"[{time.strftime('%H:%M:%S')}] ✅ 成功發布新貼文！")
+        print(f"✅ 成功發布新貼文！")
         return True
     except Exception as e:
         print(f"❌ Threads API 錯誤：{e}")
@@ -89,41 +85,34 @@ def monitor():
             desc_raw = item.findtext("description")
             link = item.findtext("link")
             
-            # 文字清洗與圖片準備
             c_title = clean_text(title)
             c_desc = clean_text(desc_raw)
             img_url = get_image_url(c_title, desc_raw)
             
-            # 組合最終訊息：標題 + 內容 + 網址 (全部黏在一起)
+            # 組合最終訊息
             full_msg = f"⚠️ {c_title} {c_desc} {link}"
 
-            # 讀取舊紀錄防止重複發文
+            # 讀取舊紀錄
             last_msg = ""
             if os.path.exists(LAST_ALERT_FILE):
                 with open(LAST_ALERT_FILE, "r", encoding="utf-8") as f:
                     last_msg = f.read().strip()
             
             if full_msg != last_msg:
-                print(f"[{time.strftime('%H:%M:%S')}] 偵測到新變動：{c_title}")
+                print(f"偵測到新警報：{c_title}")
                 if post_to_threads(full_msg, img_url):
-                    # 只有發送成功才更新紀錄檔
+                    # 只有發送成功才更新紀錄檔 
                     with open(LAST_ALERT_FILE, "w", encoding="utf-8") as f:
                         f.write(full_msg)
             else:
-                print(f"[{time.strftime('%H:%M:%S')}] 監控中...目前無新警報")
+                print("目前 RSS 內容與上一次紀錄相同，跳過發布。")
                 
     except Exception as e:
         print(f"RSS 解析錯誤：{e}")
 
 if __name__ == "__main__":
-    if not META_USER_ACCESS_TOKEN:
-        print("❌ 錯誤：找不到 Token。請確認 .env 檔案已正確設定。")
+    if not META_USER_ACCESS_TOKEN or not THREADS_USER_ID:
+        print("❌ 錯誤：找不到環境變數設定。請檢查 GitHub Secrets 或 .env 檔案。")
     else:
-        print("------------------------------------------")
-        print("🚀 台灣氣象機器人 (全警報支援版) 啟動中...")
-        print("文字規則：壓平排版，不使用 \\n\\n")
-        print("圖片規則：動態對應 W21-W64 或地震圖")
-        print("------------------------------------------")
-        while True:
-            monitor()
-            time.sleep(600) # 每 10 分鐘檢查一次
+        # 單次執行版，由 Actions 定時觸發
+        monitor()
