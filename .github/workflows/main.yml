@@ -1,0 +1,35 @@
+name: Taiwan Weather Bot
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'  # 每 10 分鐘自動執行一次
+  workflow_dispatch:        # 讓你可以手動按按鈕執行
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: pip install requests python-dotenv
+
+      - name: Execute Bot
+        env:
+          THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
+          THREADS_USER_ID: ${{ secrets.THREADS_USER_ID }}
+        run: python main.py
+
+      - name: Auto Save Record
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add last_alert.txt
+          git commit -m "Update last_alert.txt" || exit 0
+          git push
