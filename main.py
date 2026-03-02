@@ -2,22 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-weather_bot.py
-整合天氣預報、警特報、地震處理的範例程式骨架
-請在部署環境以環境變數或 config.json 提供實際 API 設定
+main.py
+完整程式碼：從 OPML (本地檔或 URL) 讀取中央氣象署 RSS，處理天氣、警特報、地震，
+並示範發文紀錄、錯誤處理、分區合併/分割發文邏輯、圖片加 ?v=timestamp 等。
+請在部署環境以環境變數或 config.json 提供實際 API 設定（THREADS_API_ENDPOINT / THREADS_API_TOKEN）。
 """
 
-import requests
-import xml.etree.ElementTree as ET
+import os
 import re
 import json
-import os
 import time
-from datetime import datetime, timezone, timedelta
+import requests
+import xml.etree.ElementTree as ET
 from html import unescape
+from datetime import datetime, timezone, timedelta
 
-# ---------- Configurable ----------
-OPML_PATH = os.getenv("OPML_PATH", "cwa_opml.xml")
+# ---------- Config ----------
+# 支援本地檔案或 URL (若為 URL，請以 https:// 開頭)
+OPML_PATH = os.getenv("OPML_PATH", "https://www.cwa.gov.tw/rss/channel.opml")
 RECORD_FILE = os.getenv("RECORD_FILE", "posted_records.json")
 GREETING_STATE_FILE = os.getenv("GREETING_STATE_FILE", "greeting_state.json")
 POST_INTERVAL_SECONDS = int(os.getenv("POST_INTERVAL_SECONDS", "180"))
@@ -56,10 +58,23 @@ def save_json(path, data):
 posted_records = load_json(RECORD_FILE, {"warnings": {}, "posts": {}})
 greeting_state = load_json(GREETING_STATE_FILE, {"morning": 0, "noon": 0, "night": 0})
 
-# ---------- OPML parsing ----------
-def load_opml(opml_path):
-    tree = ET.parse(opml_path)
-    root = tree.getroot()
+# ---------- OPML parsing (support local file or URL) ----------
+def load_opml(opml_path_or_url):
+    """
+    支援本地檔案路徑或 URL。
+    回傳 dict: { '今明天氣預報': {city: xmlUrl, ...}, '警報、特報': { ... } }
+    """
+    try:
+        if opml_path_or_url.startswith("http://") or opml_path_or_url.startswith("https://"):
+            resp = requests.get(opml_path_or_url, timeout=15)
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+        else:
+            tree = ET.parse(opml_path_or_url)
+            root = tree.getroot()
+    except Exception as e:
+        raise RuntimeError(f"載入 OPML 失敗: {e}")
+
     result = {}
     body = root.find("body")
     if body is None:
@@ -67,12 +82,14 @@ def load_opml(opml_path):
     for outline in body.findall("outline"):
         title = outline.attrib.get("title", "")
         children = {}
+        # 直接子節點
         for child in outline.findall("outline"):
             xmlUrl = child.attrib.get("xmlUrl")
             text = child.attrib.get("text") or child.attrib.get("title")
             if xmlUrl:
                 children[text] = xmlUrl
             else:
+                # 更深一層
                 for sub in child.findall("outline"):
                     xmlUrl = sub.attrib.get("xmlUrl")
                     text = sub.attrib.get("text") or sub.attrib.get("title")
@@ -85,8 +102,7 @@ def load_opml(opml_path):
 def fetch_rss_xml(url, timeout=10):
     resp = requests.get(url, timeout=timeout)
     resp.raise_for_status()
-    content = resp.content
-    return ET.fromstring(content)
+    return ET.fromstring(resp.content)
 
 def get_items_from_rss(root):
     channel = root.find("channel")
@@ -138,7 +154,7 @@ def choose_segment_by_time(segments, now=None):
 
 # ---------- extract temp and rain ----------
 TEMP_RAIN_PATTERN = re.compile(
-    r"(?P<city>[\u4e00-\u9fff\w\s\(\)]+)[：:]\s*(?P<temp_low>\d{1,2})\s*-\s*(?P<temp_high>\d{1,2})\s*°?C[，,]?\s*降雨機率[：:]\s*(?P<rain>\d{1,3})\s*%?"
+    r"(?P<city>[\u4e00-\u9fff\w\s\(\)]+)[：:]\s*(?P<temp_low>\d{1,2})\s*[-~]\s*(?P<temp_high>\d{1,2})\s*°?C[，,]?\s*降雨機率[：:]\s*(?P<rain>\d{1,3})\s*%?"
 )
 
 def extract_city_weather_from_text(text):
@@ -193,11 +209,13 @@ def pick_greeting(now=None):
 # ---------- post to API placeholder ----------
 def post_to_api(content, attachments=None):
     """
-    請在部署時替換為實際發文實作。
-    範例回傳格式：{"ok": True, "id": "post-id"} 或 {"ok": False, "error": "..."}
+    請在部署時替換為實際發文實作（Threads/Telegram/Discord 等）。
+    回傳格式：{"ok": True, "id": "post-id"} 或 {"ok": False, "error": "..."}
+    目前為 mock 回傳，方便測試。
     """
     try:
-        # 實務上請用 requests.post 並帶入授權 header
+        # 若要實作真實 API，請在此加入 requests.post 並帶入授權 header
+        # 範例：
         # headers = {"Authorization": f"Bearer {THREADS_API_TOKEN}"}
         # resp = requests.post(THREADS_API_ENDPOINT, json={"content": content}, headers=headers, timeout=10)
         # resp.raise_for_status()
@@ -319,6 +337,9 @@ def run_weather_pipeline(opml_path):
             print(f"[ERROR] 下載或解析 {city} RSS 失敗: {e}")
             continue
     region_msgs = build_region_messages(city_weather_map, update_time_str)
+    if not region_msgs:
+        print("[WARN] 未取得任何區域天氣資料")
+        return
     combined_text = "\n\n".join(region_msgs.values())
     greeting = pick_greeting()
     if len(combined_text) <= MAX_SINGLE_POST_CHARS:
@@ -346,14 +367,19 @@ def run_weather_pipeline(opml_path):
 
 # ---------- main ----------
 def main():
-    if not os.path.exists(OPML_PATH):
-        print(f"[FATAL] 找不到 OPML 檔案：{OPML_PATH}")
-        return
+    # 1) 天氣 pipeline
     try:
         run_weather_pipeline(OPML_PATH)
     except Exception as e:
         print(f"[ERROR] 天氣 pipeline 發生未捕捉例外: {e}")
-    opml = load_opml(OPML_PATH)
+
+    # 2) 警特報 pipeline（逐筆檢查）
+    try:
+        opml = load_opml(OPML_PATH)
+    except Exception as e:
+        print(f"[FATAL] 載入 OPML 失敗: {e}")
+        return
+
     warnings_feed = opml.get("警報、特報", {}).get("警報、特報")
     if warnings_feed:
         try:
