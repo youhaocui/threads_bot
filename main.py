@@ -1,118 +1,367 @@
-import os
-import time
-import re
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+weather_bot.py
+整合天氣預報、警特報、地震處理的範例程式骨架
+請在部署環境以環境變數或 config.json 提供實際 API 設定
+"""
+
 import requests
 import xml.etree.ElementTree as ET
-from dotenv import load_dotenv
+import re
+import json
+import os
+import time
+from datetime import datetime, timezone, timedelta
+from html import unescape
 
-# 加載環境變數 (GitHub Actions 會自動注入 Secrets)
-load_dotenv()
+# ---------- Configurable ----------
+OPML_PATH = os.getenv("OPML_PATH", "cwa_opml.xml")
+RECORD_FILE = os.getenv("RECORD_FILE", "posted_records.json")
+GREETING_STATE_FILE = os.getenv("GREETING_STATE_FILE", "greeting_state.json")
+POST_INTERVAL_SECONDS = int(os.getenv("POST_INTERVAL_SECONDS", "180"))
+MAX_SINGLE_POST_CHARS = int(os.getenv("MAX_SINGLE_POST_CHARS", "500"))
+USER_TIMEZONE = timezone(timedelta(hours=8))
+THREADS_API_ENDPOINT = os.getenv("THREADS_API_ENDPOINT", "")
+THREADS_API_TOKEN = os.getenv("THREADS_API_TOKEN", "")
 
-# 配置區 (從 GitHub Secrets 讀取)
-META_USER_ACCESS_TOKEN = os.getenv("THREADS_ACCESS_TOKEN")
-THREADS_USER_ID = os.getenv("THREADS_USER_ID")
-LAST_ALERT_FILE = "last_alert.txt"
-
-# 警報圖片編號對照表
-ALERT_MAP = {
-    "颱風": "W21", "雨": "W26", "強風": "W25", "低溫": "W28",
-    "高溫": "W30", "濃霧": "W23", "長浪": "W29", "雷雨": "W27", "地震": "W64"
+# ---------- Region mapping ----------
+REGION_MAP = {
+    "北部": ["臺北市", "新北市", "基隆市", "桃園市", "新竹市", "新竹縣", "宜蘭縣"],
+    "中部": ["苗栗縣", "臺中市", "彰化縣", "南投縣", "雲林縣"],
+    "南部": ["嘉義市", "嘉義縣", "臺南市", "高雄市", "屏東縣"],
+    "東部": ["花蓮縣", "臺東縣"],
+    "外島": ["澎湖縣", "金門縣", "連江縣"]
 }
 
-def clean_text(s: str) -> str:
-    """徹底壓平文字，將換行符號替換為空格，確保不出現 \\n\\n"""
-    if not s: return ""
-    s = s.replace("\\n", " ").replace("\n", " ").replace("\r", " ")
-    return re.sub(r"\s+", " ", s).strip()
+GREETINGS = {
+    "morning": ["🌞 早安，祝你有美好的一天！", "🌞 早安，保持愉快心情！"],
+    "noon": ["☀️ 午安，外出請注意天氣變化！", "☀️ 午安，祝你工作順利！"],
+    "night": ["🌙 晚安，注意保暖，祝你一夜好眠！", "🌙 晚安，保持安全，平安入睡！"]
+}
 
-def get_image_url(title, description):
-    """根據警報類型決定圖片網址 (支援地震動態 ID)"""
-    # 1. 地震報告：抓取 EC 開頭的動態編號圖
-    if "地震" in title:
-        match = re.search(r'EC\d{13,}', description)
-        if match:
-            eq_id = match.group(0)
-            v_time = time.strftime("%Y%m%d%H%M%S")
-            return f"https://www.cwa.gov.tw/Data/earthquake/img/{eq_id}_H.png?v={v_time}"
-        return "https://www.cwa.gov.tw/Data/warning/W64_C.png"
-
-    # 2. 一般天氣警報：比對關鍵字
-    for keyword, code in ALERT_MAP.items():
-        if keyword in title:
-            return f"https://www.cwa.gov.tw/Data/warning/{code}_C.png"
-    
-    # 預設圖片
-    return "https://www.cwa.gov.tw/Data/warning/W25_C.png"
-
-def post_to_threads(text, image_url):
-    """Threads API 兩階段發布邏輯"""
-    base_url = "https://graph.threads.net/v1.0"
-    auth = {"access_token": META_USER_ACCESS_TOKEN}
-    
+# ---------- Persistence helpers ----------
+def load_json(path, default):
     try:
-        # 第一階段：建立媒體容器
-        payload = {"text": text, "media_type": "IMAGE", "image_url": image_url}
-        res = requests.post(f"{base_url}/{THREADS_USER_ID}/threads", params=auth, data=payload, timeout=20)
-        
-        if res.status_code == 400:
-            print(f"❌ Token 已失效：{res.text}")
-            return False
-            
-        res.raise_for_status()
-        creation_id = res.json().get("id")
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-        # 第二階段：正式發布
-        requests.post(f"{base_url}/{THREADS_USER_ID}/threads_publish", 
-                      params=auth, data={"creation_id": creation_id}, timeout=20)
-        
-        print(f"✅ 成功發布新貼文！")
-        return True
-    except Exception as e:
-        print(f"❌ Threads API 錯誤：{e}")
-        return False
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def monitor():
-    """監控氣象署 RSS 並執行發布邏輯"""
-    rss_url = "https://www.cwa.gov.tw/rss/Data/cwa_warning.xml"
-    try:
-        resp = requests.get(rss_url, timeout=15)
-        resp.encoding = 'utf-8'
-        root = ET.fromstring(resp.content)
-        item = root.find(".//item")
-        
-        if item is not None:
-            title = item.findtext("title")
-            desc_raw = item.findtext("description")
-            link = item.findtext("link")
-            
-            c_title = clean_text(title)
-            c_desc = clean_text(desc_raw)
-            img_url = get_image_url(c_title, desc_raw)
-            
-            # 組合最終訊息
-            full_msg = f"⚠️ {c_title} {c_desc} {link}"
+posted_records = load_json(RECORD_FILE, {"warnings": {}, "posts": {}})
+greeting_state = load_json(GREETING_STATE_FILE, {"morning": 0, "noon": 0, "night": 0})
 
-            # 讀取舊紀錄
-            last_msg = ""
-            if os.path.exists(LAST_ALERT_FILE):
-                with open(LAST_ALERT_FILE, "r", encoding="utf-8") as f:
-                    last_msg = f.read().strip()
-            
-            if full_msg != last_msg:
-                print(f"偵測到新警報：{c_title}")
-                if post_to_threads(full_msg, img_url):
-                    # 只有發送成功才更新紀錄檔 
-                    with open(LAST_ALERT_FILE, "w", encoding="utf-8") as f:
-                        f.write(full_msg)
+# ---------- OPML parsing ----------
+def load_opml(opml_path):
+    tree = ET.parse(opml_path)
+    root = tree.getroot()
+    result = {}
+    body = root.find("body")
+    if body is None:
+        return result
+    for outline in body.findall("outline"):
+        title = outline.attrib.get("title", "")
+        children = {}
+        for child in outline.findall("outline"):
+            xmlUrl = child.attrib.get("xmlUrl")
+            text = child.attrib.get("text") or child.attrib.get("title")
+            if xmlUrl:
+                children[text] = xmlUrl
             else:
-                print("目前 RSS 內容與上一次紀錄相同，跳過發布。")
-                
+                for sub in child.findall("outline"):
+                    xmlUrl = sub.attrib.get("xmlUrl")
+                    text = sub.attrib.get("text") or sub.attrib.get("title")
+                    if xmlUrl:
+                        children[text] = xmlUrl
+        result[title] = children
+    return result
+
+# ---------- RSS fetch ----------
+def fetch_rss_xml(url, timeout=10):
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    content = resp.content
+    return ET.fromstring(content)
+
+def get_items_from_rss(root):
+    channel = root.find("channel")
+    if channel is None:
+        return []
+    return channel.findall("item")
+
+# ---------- description segmentation ----------
+SEGMENT_HEADERS = ["今日白天", "今晚明晨", "明日白天", "今日", "今晚", "明日"]
+
+def split_description_into_segments(description_html):
+    text = unescape(re.sub(r"<[^>]+>", "", description_html)).strip()
+    segments = {}
+    pattern = r"(今日白天|今晚明晨|明日白天|今日|今晚|明日)"
+    parts = re.split(pattern, text)
+    if len(parts) <= 1:
+        segments["full"] = text
+        return segments
+    i = 0
+    while i < len(parts):
+        if parts[i] == "":
+            i += 1
+            continue
+        if re.match(pattern, parts[i]):
+            header = parts[i]
+            content = parts[i+1] if i+1 < len(parts) else ""
+            segments[header] = content.strip()
+            i += 2
+        else:
+            segments.setdefault("pre", "")
+            segments["pre"] += parts[i].strip()
+            i += 1
+    return segments
+
+def choose_segment_by_time(segments, now=None):
+    if now is None:
+        now = datetime.now(USER_TIMEZONE)
+    hour = now.hour
+    is_day = 6 <= hour < 18
+    if is_day:
+        for key in ["今晚明晨", "今晚", "明日白天", "明日", "full"]:
+            if key in segments:
+                return key, segments[key]
+    else:
+        for key in ["明日白天", "明日", "今晚明晨", "今晚", "full"]:
+            if key in segments:
+                return key, segments[key]
+    return "full", segments.get("full", "")
+
+# ---------- extract temp and rain ----------
+TEMP_RAIN_PATTERN = re.compile(
+    r"(?P<city>[\u4e00-\u9fff\w\s\(\)]+)[：:]\s*(?P<temp_low>\d{1,2})\s*-\s*(?P<temp_high>\d{1,2})\s*°?C[，,]?\s*降雨機率[：:]\s*(?P<rain>\d{1,3})\s*%?"
+)
+
+def extract_city_weather_from_text(text):
+    results = {}
+    for m in TEMP_RAIN_PATTERN.finditer(text):
+        city = m.group("city").strip()
+        low = m.group("temp_low")
+        high = m.group("temp_high")
+        rain = m.group("rain")
+        results[city] = {"temp": f"{low}-{high}°C", "rain": f"{rain}%"}
+    if not results:
+        alt_pattern = re.compile(r"(?P<city>[\u4e00-\u9fff\w\s\(\)]+)\s+(?P<temp_low>\d{1,2})\s*[~\-]\s*(?P<temp_high>\d{1,2})\s*°?C.*?降雨機率\s*(?P<rain>\d{1,3})\s*%?")
+        for m in alt_pattern.finditer(text):
+            city = m.group("city").strip()
+            low = m.group("temp_low")
+            high = m.group("temp_high")
+            rain = m.group("rain")
+            results[city] = {"temp": f"{low}-{high}°C", "rain": f"{rain}%"}
+    return results
+
+# ---------- build region messages ----------
+def build_region_messages(city_weather_map, update_time):
+    region_msgs = {}
+    for region, cities in REGION_MAP.items():
+        lines = []
+        for city in cities:
+            if city in city_weather_map:
+                w = city_weather_map[city]
+                lines.append(f"{city}：{w['temp']}，降雨機率：{w['rain']}")
+        if lines:
+            header = f"🌤 今日{region}地區天氣 ({update_time})"
+            region_msgs[region] = header + "\n" + "\n".join(lines)
+    return region_msgs
+
+# ---------- greeting pick ----------
+def pick_greeting(now=None):
+    if now is None:
+        now = datetime.now(USER_TIMEZONE)
+    hour = now.hour
+    if 6 <= hour < 12:
+        key = "morning"
+    elif 12 <= hour < 18:
+        key = "noon"
+    else:
+        key = "night"
+    idx = greeting_state.get(key, 0) % len(GREETINGS[key])
+    greeting = GREETINGS[key][idx]
+    greeting_state[key] = idx + 1
+    save_json(GREETING_STATE_FILE, greeting_state)
+    return greeting
+
+# ---------- post to API placeholder ----------
+def post_to_api(content, attachments=None):
+    """
+    請在部署時替換為實際發文實作。
+    範例回傳格式：{"ok": True, "id": "post-id"} 或 {"ok": False, "error": "..."}
+    """
+    try:
+        # 實務上請用 requests.post 並帶入授權 header
+        # headers = {"Authorization": f"Bearer {THREADS_API_TOKEN}"}
+        # resp = requests.post(THREADS_API_ENDPOINT, json={"content": content}, headers=headers, timeout=10)
+        # resp.raise_for_status()
+        # return {"ok": True, "id": resp.json().get("id")}
+        return {"ok": True, "id": f"mock-{int(time.time())}"}
     except Exception as e:
-        print(f"RSS 解析錯誤：{e}")
+        return {"ok": False, "error": str(e)}
+
+# ---------- warnings feed processing ----------
+def process_warnings_feed(warnings_url):
+    try:
+        root = fetch_rss_xml(warnings_url)
+    except Exception as e:
+        print(f"[WARN] 下載警報 RSS 失敗: {e}")
+        return
+    items = get_items_from_rss(root)
+    for item in items:
+        try:
+            title = item.findtext("title", "").strip()
+            pubDate = item.findtext("pubDate", "").strip()
+            link = item.findtext("link", "").strip()
+            description = item.findtext("description", "") or ""
+            key = f"{title}||{pubDate}"
+            if key in posted_records["warnings"]:
+                continue
+            image_url = None
+            m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', description)
+            if m:
+                image_url = m.group(1)
+            enc = item.find("enclosure")
+            if enc is not None and enc.attrib.get("url"):
+                image_url = enc.attrib.get("url")
+            if image_url:
+                ts = int(time.time())
+                sep = "&" if "?" in image_url else "?"
+                image_url = f"{image_url}{sep}v={ts}"
+            content = f"🚨 {title}\n\n{unescape(re.sub(r'<[^>]+>', '', description)).strip()}\n\n官方連結：{link}"
+            attachments = [image_url] if image_url else None
+            resp = post_to_api(content, attachments=attachments)
+            if resp.get("ok"):
+                posted_records["warnings"][key] = {"posted_at": datetime.now(USER_TIMEZONE).isoformat(), "post_id": resp.get("id")}
+                print(f"[INFO] 已發佈警報: {title}")
+            else:
+                posted_records["warnings"][key] = {"posted_at": datetime.now(USER_TIMEZONE).isoformat(), "post_id": None, "error": resp.get("error")}
+                print(f"[ERROR] 發文失敗，但已更新紀錄: {title} / error: {resp.get('error')}")
+            save_json(RECORD_FILE, posted_records)
+        except Exception as e:
+            print(f"[ERROR] 處理某筆警報時發生例外: {e}")
+            continue
+
+# ---------- earthquake item processing ----------
+def process_earthquake_item(item):
+    title = item.findtext("title", "").strip()
+    pubDate = item.findtext("pubDate", "").strip()
+    link = item.findtext("link", "").strip()
+    description = item.findtext("description", "") or ""
+    is_significant = "E-A0015-001" in (title + description)
+    is_local = "E-A0016-001" in (title + description)
+    image_url = None
+    m = re.search(r'ReportImageURI[:=]\s*(https?://[^\s<]+)', description)
+    if m:
+        image_url = m.group(1)
+    else:
+        m2 = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', description)
+        if m2:
+            image_url = m2.group(1)
+    if image_url:
+        ts = int(time.time())
+        sep = "&" if "?" in image_url else "?"
+        image_url = f"{image_url}{sep}v={ts}"
+    plain = unescape(re.sub(r"<[^>]+>", "", description)).strip()
+    if len(plain) <= MAX_SINGLE_POST_CHARS:
+        content = f"🌏 {title}\n\n{plain}\n\n官方連結：{link}"
+    else:
+        mmax = re.search(r"最大震度[:：]?\s*([^\s，。]+)", plain)
+        if mmax:
+            max_info = mmax.group(1)
+        else:
+            max_info = title
+        content = f"🌏 {title}\n\n最大震度：{max_info}\n\n詳情請見官方連結：{link}"
+    attachments = [image_url] if image_url else None
+    resp = post_to_api(content, attachments=attachments)
+    key = f"{title}||{pubDate}"
+    posted_records["warnings"][key] = {"posted_at": datetime.now(USER_TIMEZONE).isoformat(), "post_id": resp.get("id") if resp.get("ok") else None, "error": resp.get("error") if not resp.get("ok") else None}
+    save_json(RECORD_FILE, posted_records)
+    if resp.get("ok"):
+        print(f"[INFO] 已發佈地震: {title}")
+    else:
+        print(f"[ERROR] 發佈地震失敗，但已更新紀錄: {title}")
+
+# ---------- weather pipeline ----------
+def run_weather_pipeline(opml_path):
+    opml = load_opml(opml_path)
+    forecast_map = opml.get("今明天氣預報", {})
+    city_weather_map = {}
+    update_time_str = datetime.now(USER_TIMEZONE).strftime("%m月%d日 %H:%M 更新")
+    for city, url in forecast_map.items():
+        try:
+            root = fetch_rss_xml(url)
+            items = get_items_from_rss(root)
+            if not items:
+                continue
+            item = items[0]
+            description = item.findtext("description", "") or ""
+            segments = split_description_into_segments(description)
+            seg_key, seg_text = choose_segment_by_time(segments)
+            extracted = extract_city_weather_from_text(seg_text)
+            if not extracted:
+                extracted = extract_city_weather_from_text(description)
+            if city in extracted:
+                city_weather_map[city] = extracted[city]
+            else:
+                if extracted:
+                    first_city = next(iter(extracted))
+                    city_weather_map[city] = extracted[first_city]
+                else:
+                    print(f"[WARN] 無法從 {city} 的 RSS 解析出溫度/降雨資訊")
+        except Exception as e:
+            print(f"[ERROR] 下載或解析 {city} RSS 失敗: {e}")
+            continue
+    region_msgs = build_region_messages(city_weather_map, update_time_str)
+    combined_text = "\n\n".join(region_msgs.values())
+    greeting = pick_greeting()
+    if len(combined_text) <= MAX_SINGLE_POST_CHARS:
+        content = f"{greeting}\n\n{combined_text}\n\n詳細報告：https://www.cwa.gov.tw/..."
+        resp = post_to_api(content)
+        key = f"weather_all||{datetime.now(USER_TIMEZONE).isoformat()}"
+        posted_records["posts"][key] = {"posted_at": datetime.now(USER_TIMEZONE).isoformat(), "post_id": resp.get("id") if resp.get("ok") else None, "error": resp.get("error") if not resp.get("ok") else None}
+        save_json(RECORD_FILE, posted_records)
+        if resp.get("ok"):
+            print("[INFO] 已發佈合併天氣貼文")
+        else:
+            print("[ERROR] 發佈合併天氣貼文失敗，但已更新紀錄")
+    else:
+        for region, msg in region_msgs.items():
+            content = f"{greeting}\n\n{msg}\n\n詳細報告：https://www.cwa.gov.tw/..."
+            resp = post_to_api(content)
+            key = f"weather_{region}||{datetime.now(USER_TIMEZONE).isoformat()}"
+            posted_records["posts"][key] = {"posted_at": datetime.now(USER_TIMEZONE).isoformat(), "post_id": resp.get("id") if resp.get("ok") else None, "error": resp.get("error") if not resp.get("ok") else None}
+            save_json(RECORD_FILE, posted_records)
+            if resp.get("ok"):
+                print(f"[INFO] 已發佈 {region} 天氣貼文")
+            else:
+                print(f"[ERROR] 發佈 {region} 天氣貼文失敗，但已更新紀錄")
+            time.sleep(POST_INTERVAL_SECONDS)
+
+# ---------- main ----------
+def main():
+    if not os.path.exists(OPML_PATH):
+        print(f"[FATAL] 找不到 OPML 檔案：{OPML_PATH}")
+        return
+    try:
+        run_weather_pipeline(OPML_PATH)
+    except Exception as e:
+        print(f"[ERROR] 天氣 pipeline 發生未捕捉例外: {e}")
+    opml = load_opml(OPML_PATH)
+    warnings_feed = opml.get("警報、特報", {}).get("警報、特報")
+    if warnings_feed:
+        try:
+            process_warnings_feed(warnings_feed)
+        except Exception as e:
+            print(f"[ERROR] 警特報 pipeline 發生未捕捉例外: {e}")
+    else:
+        print("[WARN] OPML 中找不到 警報、特報 RSS")
 
 if __name__ == "__main__":
-    if not META_USER_ACCESS_TOKEN or not THREADS_USER_ID:
-        print("❌ 錯誤：找不到環境變數設定。請檢查 GitHub Secrets 或 .env 檔案。")
-    else:
-        # 單次執行版，由 Actions 定時觸發
-        monitor()
+    main()
