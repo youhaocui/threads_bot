@@ -1,0 +1,36 @@
+<opml version="1.1">
+<head>
+<title>RSS閱讀器</title>
+</head>
+<body>
+<outline title="中央氣象署RSS頻道">
+<outline title="今明天氣預報">
+<outline title="臺北市" text="臺北市" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_01.xml"/>
+<outline title="新北市" text="新北市" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_04.xml"/>
+<outline title="桃園市" text="桃園市" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_05.xml"/>
+<outline title="臺中市" text="臺中市" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_08.xml"/>
+<outline title="臺南市" text="臺南市" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_13.xml"/>
+<outline title="高雄市" text="高雄市" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_02.xml"/>
+<outline title="基隆市" text="基隆市" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_03.xml"/>
+<outline title="新竹縣" text="新竹縣" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_06.xml"/>
+<outline title="新竹市" text="新竹市" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_14.xml"/>
+<outline title="苗栗縣" text="苗栗縣" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_07.xml"/>
+<outline title="彰化縣" text="彰化縣" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_09.xml"/>
+<outline title="南投縣" text="南投縣" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_10.xml"/>
+<outline title="雲林縣" text="雲林縣" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_11.xml"/>
+<outline title="嘉義縣" text="嘉義縣" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_12.xml"/>
+<outline title="嘉義市" text="嘉義市" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_16.xml"/>
+<outline title="屏東縣" text="屏東縣" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_15.xml"/>
+<outline title="宜蘭縣" text="宜蘭縣" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_17.xml"/>
+<outline title="花蓮縣" text="花蓮縣" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_18.xml"/>
+<outline title="臺東縣" text="臺東縣" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_19.xml"/>
+<outline title="澎湖縣" text="澎湖縣" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_20.xml"/>
+<outline title="金門縣" text="金門縣" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_21.xml"/>
+<outline title="連江縣" text="連江縣" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/forecast/36_22.xml"/>
+</outline>
+<outline title="警報、特報">
+<outline title="警報、特報" text="警報、特報" type="rss" xmlUrl="https://www.cwa.gov.tw/rss/Data/cwa_warning.xml"/>
+</outline>
+</outline>
+</body>
+</opml>
