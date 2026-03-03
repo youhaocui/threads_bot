@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 main.py
-完整程式碼：從 OPML (本地檔或 URL) 讀取中央氣象署 RSS，處理天氣、警特報、地震，
-並示範發文紀錄、錯誤處理、分區合併/分割發文邏輯、圖片加 ?v=timestamp 等。
-請在部署環境以環境變數或 config.json 提供實際 API 設定（THREADS_API_ENDPOINT / THREADS_API_TOKEN）。
+從中央氣象署 OPML / RSS 讀取天氣與警特報，處理天氣分區發文、警報逐筆發文（含長浪判斷與圖片）、地震處理、發文紀錄與錯誤處理。
+部署時請以環境變數或 config.json 提供實際 API 設定（THREADS_API_ENDPOINT / THREADS_API_TOKEN）。
 """
 
 import os
@@ -17,7 +16,10 @@ from html import unescape
 from datetime import datetime, timezone, timedelta
 
 # ---------- Config ----------
+# 預設使用中央氣象署 OPML 主檔（可被環境變數覆蓋）
 OPML_PATH = os.getenv("OPML_PATH", "https://www.cwa.gov.tw/rss/channel.opml")
+# 直接指定警特報 RSS（若你要強制直接抓 RSS，可改這個值）
+FORCE_WARNINGS_RSS = os.getenv("FORCE_WARNINGS_RSS", "https://www.cwa.gov.tw/rss/Data/cwa_warning.xml")
 RECORD_FILE = os.getenv("RECORD_FILE", "posted_records.json")
 GREETING_STATE_FILE = os.getenv("GREETING_STATE_FILE", "greeting_state.json")
 POST_INTERVAL_SECONDS = int(os.getenv("POST_INTERVAL_SECONDS", "180"))
@@ -26,7 +28,7 @@ USER_TIMEZONE = timezone(timedelta(hours=8))
 THREADS_API_ENDPOINT = os.getenv("THREADS_API_ENDPOINT", "")
 THREADS_API_TOKEN = os.getenv("THREADS_API_TOKEN", "")
 
-# 長浪圖片（預設為你指定的 URL，可用環境變數覆蓋）
+# 長浪圖片（若 RSS item 判定為長浪，會附上此圖）
 SURGE_IMAGE_URL = os.getenv("SURGE_IMAGE_URL", "https://www.cwa.gov.tw/Data/warning/Surge_Swell/Swell_MapTaiwan02.png?v=2026030319-2")
 
 # ---------- Region mapping ----------
@@ -87,18 +89,15 @@ def load_opml(opml_path_or_url):
     if body is None:
         return result
 
-    # 針對每個第一層 outline（例如 "今明天氣預報", "警報、特報"）
     for outline in body.findall("outline"):
         title = outline.attrib.get("title", "") or outline.attrib.get("text", "")
         children = {}
-        # 先嘗試直接子節點有 xmlUrl 的情況
         for child in outline.findall("outline"):
             xmlUrl = child.attrib.get("xmlUrl")
             text = child.attrib.get("text") or child.attrib.get("title")
             if xmlUrl and text:
                 children[text] = xmlUrl
             else:
-                # 處理更深一層（例如 outline -> outline -> outline）
                 for sub in child.findall("outline"):
                     xmlUrl = sub.attrib.get("xmlUrl")
                     text = sub.attrib.get("text") or sub.attrib.get("title")
@@ -239,7 +238,7 @@ def post_to_api(content, attachments=None):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---------- warnings feed processing ----------
+# ---------- warnings feed processing (with surge detection) ----------
 def process_warnings_feed(warnings_url):
     try:
         root = fetch_rss_xml(warnings_url)
@@ -256,27 +255,45 @@ def process_warnings_feed(warnings_url):
             key = f"{title}||{pubDate}"
             if key in posted_records["warnings"]:
                 continue
+
+            # 判斷是否為長浪/海象相關警報（可擴充關鍵字）
+            desc_plain = unescape(re.sub(r"<[^>]+>", "", description)).strip()
+            is_surge = any(k in title for k in ["長浪", "湧浪", "海象"]) or any(k in desc_plain for k in ["長浪", "湧浪", "海象"])
+
             image_url = None
-            m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', description)
-            if m:
-                image_url = m.group(1)
-            enc = item.find("enclosure")
-            if enc is not None and enc.attrib.get("url"):
-                image_url = enc.attrib.get("url")
+            if is_surge:
+                image_url = SURGE_IMAGE_URL
+                greeting = pick_greeting(kind="surge")
+            else:
+                # 一般警報抓 RSS 裡的圖片或 enclosure
+                m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', description)
+                if m:
+                    image_url = m.group(1)
+                enc = item.find("enclosure")
+                if enc is not None and enc.attrib.get("url"):
+                    image_url = enc.attrib.get("url")
+                greeting = pick_greeting()
+
             if image_url:
                 ts = int(time.time())
                 sep = "&" if "?" in image_url else "?"
                 image_url = f"{image_url}{sep}v={ts}"
-            content = f"🚨 {title}\n\n{unescape(re.sub(r'<[^>]+>', '', description)).strip()}\n\n官方連結：{link}"
+
+            content = f"{greeting}\n\n🚨 {title}\n\n{desc_plain}\n\n官方連結：{link}"
             attachments = [image_url] if image_url else None
             resp = post_to_api(content, attachments=attachments)
+
+            posted_records["warnings"][key] = {
+                "posted_at": datetime.now(USER_TIMEZONE).isoformat(),
+                "post_id": resp.get("id") if resp.get("ok") else None,
+                "error": resp.get("error") if not resp.get("ok") else None
+            }
+            save_json(RECORD_FILE, posted_records)
+
             if resp.get("ok"):
-                posted_records["warnings"][key] = {"posted_at": datetime.now(USER_TIMEZONE).isoformat(), "post_id": resp.get("id")}
                 print(f"[INFO] 已發佈警報: {title}")
             else:
-                posted_records["warnings"][key] = {"posted_at": datetime.now(USER_TIMEZONE).isoformat(), "post_id": None, "error": resp.get("error")}
                 print(f"[ERROR] 發文失敗，但已更新紀錄: {title} / error: {resp.get('error')}")
-            save_json(RECORD_FILE, posted_records)
         except Exception as e:
             print(f"[ERROR] 處理某筆警報時發生例外: {e}")
             continue
@@ -319,25 +336,6 @@ def process_earthquake_item(item):
     else:
         print(f"[ERROR] 發佈地震失敗，但已更新紀錄: {title}")
 
-# ---------- surge/swell processing ----------
-def process_surge_swell(image_url=SURGE_IMAGE_URL):
-    """
-    發佈長浪/海象提醒，固定使用 SURGE_IMAGE_URL（並加上時間戳避免快取）。
-    """
-    ts = int(time.time())
-    sep = "&" if "?" in image_url else "?"
-    image_with_ts = f"{image_url}{sep}v={ts}"
-    greeting = pick_greeting(kind="surge")
-    content = f"{greeting}\n\n📢 長浪/海象示意圖如下，請注意海邊活動安全。\n\n資料來源：中央氣象局"
-    resp = post_to_api(content, attachments=[image_with_ts])
-    key = f"surge||{datetime.now(USER_TIMEZONE).isoformat()}"
-    posted_records["posts"][key] = {"posted_at": datetime.now(USER_TIMEZONE).isoformat(), "post_id": resp.get("id") if resp.get("ok") else None, "error": resp.get("error") if not resp.get("ok") else None}
-    save_json(RECORD_FILE, posted_records)
-    if resp.get("ok"):
-        print("[INFO] 已發佈長浪/海象提醒")
-    else:
-        print("[ERROR] 發佈長浪/海象提醒失敗，但已更新紀錄")
-
 # ---------- weather pipeline ----------
 def run_weather_pipeline(opml_path):
     opml = load_opml(opml_path)
@@ -352,7 +350,7 @@ def run_weather_pipeline(opml_path):
                 continue
             item = items[0]
             description = item.findtext("description", "") or ""
-            # debug: 若需要檢查 description，取消下一行註解
+            # 若需要 debug description，取消下一行註解
             # print(f"[DEBUG] {city} description:\n{description}\n---")
             segments = split_description_into_segments(description)
             seg_key, seg_text = choose_segment_by_time(segments)
@@ -401,33 +399,29 @@ def run_weather_pipeline(opml_path):
 
 # ---------- main ----------
 def main():
-    # 1) 天氣 pipeline
+    # 1) 天氣 pipeline（使用 OPML 的 今明天氣預報）
     try:
         run_weather_pipeline(OPML_PATH)
     except Exception as e:
         print(f"[ERROR] 天氣 pipeline 發生未捕捉例外: {e}")
 
-    # 2) 警特報 pipeline（逐筆檢查）
-    try:
-        opml = load_opml(OPML_PATH)
-    except Exception as e:
-        print(f"[FATAL] 載入 OPML 失敗: {e}")
-        return
-
-    # 取出警報 feed：若子節點名稱與父節點相同，取第一個 value
-    warnings_map = opml.get("警報、特報", {})
+    # 2) 警特報 pipeline（直接使用 FORCE_WARNINGS_RSS，或從 OPML 取出）
     warnings_feed = None
-    if isinstance(warnings_map, dict):
-        # 可能是 {"警報、特報": "https://..."} 或 {"警報、特報": {...}}
-        # 優先取第一個字串型的 URL
-        for v in warnings_map.values():
-            if isinstance(v, str) and v.startswith("http"):
-                warnings_feed = v
-                break
+
+    # 優先使用強制指定的 RSS（環境變數 FORCE_WARNINGS_RSS）
+    if FORCE_WARNINGS_RSS:
+        warnings_feed = FORCE_WARNINGS_RSS
+
+    # 若未強制指定，嘗試從 OPML 取出
     if not warnings_feed:
-        first_val = next(iter(warnings_map.values()), None)
-        if isinstance(first_val, str) and first_val.startswith("http"):
-            warnings_feed = first_val
+        try:
+            opml = load_opml(OPML_PATH)
+            warnings_map = opml.get("警報、特報", {})
+            # 取第一個 value（通常是 "警報、特報": "https://.../cwa_warning.xml"）
+            warnings_feed = next(iter(warnings_map.values()), None)
+        except Exception as e:
+            print(f"[WARN] 嘗試從 OPML 取得警報 RSS 失敗: {e}")
+            warnings_feed = None
 
     if warnings_feed:
         try:
@@ -436,12 +430,6 @@ def main():
             print(f"[ERROR] 警特報 pipeline 發生未捕捉例外: {e}")
     else:
         print("[WARN] OPML 中找不到 警報、特報 RSS")
-
-    # 3) 長浪/海象提醒（可視情況啟動）
-    try:
-        process_surge_swell()
-    except Exception as e:
-        print(f"[ERROR] 長浪/海象 pipeline 發生例外: {e}")
 
 if __name__ == "__main__":
     main()
