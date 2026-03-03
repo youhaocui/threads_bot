@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-簡化版 main.py
-使用 Meta Threads API 的兩階段流程（與你能成功的範例一致）：
+簡化版 main.py（已修正）
+使用 Meta Threads API 的兩階段流程：
 1) POST /{user_id}/threads 建立 creation_id（可同時帶 text + media_type + image_url）
 2) POST /{user_id}/threads_publish 使用 creation_id 正式發布
+
 部署時請以環境變數提供 THREADS_ACCESS_TOKEN 與 THREADS_USER_ID
 """
 
@@ -37,7 +38,7 @@ THREADS_USER_ID = os.getenv("THREADS_USER_ID", "")
 # 長浪圖片（可用環境變數覆蓋）
 SURGE_IMAGE_URL = os.getenv("SURGE_IMAGE_URL", "https://www.cwa.gov.tw/Data/warning/Surge_Swell/Swell_MapTaiwan02.png?v=2026030319-2")
 
-# Region map & greetings (保留原設定)
+# Region map & greetings
 REGION_MAP = {
     "北部": ["臺北市", "新北市", "基隆市", "桃園市", "新竹市", "新竹縣", "宜蘭縣"],
     "中部": ["苗栗縣", "臺中市", "彰化縣", "南投縣", "雲林縣"],
@@ -229,15 +230,16 @@ def _auth_params():
 def _create_creation(text, image_url=None):
     """
     使用 POST /{user_id}/threads 建立 creation（回傳 creation_id）
-    使用 form-data (data=) 與 params=auth，符合成功範例。
+    使用 form-data (data=) 與 params=auth。
+    確保：若有 image_url，一定同時帶 media_type=IMAGE。
     """
     if not THREADS_USER_ID or not THREADS_ACCESS_TOKEN:
         logging.debug("Threads credentials not set for create_creation.")
         return None, "no_credentials"
 
     payload = {"text": text}
-    # 若有圖片，直接帶 media_type + image_url（簡化流程）
     if image_url:
+        # **關鍵**：只要有圖片就一定帶 media_type
         payload["media_type"] = "IMAGE"
         payload["image_url"] = image_url
 
@@ -248,7 +250,6 @@ def _create_creation(text, image_url=None):
             data=payload,
             timeout=20
         )
-        # 直接回傳原始錯誤內容以利 debug
         if not resp.ok:
             logging.error("create_creation error: %s %s", resp.status_code, resp.text)
             return None, resp.text
@@ -301,7 +302,6 @@ def post_to_api(content, attachments=None):
 
     image_url = None
     if attachments:
-        # 只使用第一張圖片以符合簡化流程
         for a in attachments:
             if a:
                 image_url = a
@@ -313,7 +313,6 @@ def post_to_api(content, attachments=None):
 
     post_id, err2 = _publish_creation(creation_id)
     if not post_id:
-        # 若 publish 失敗，仍回傳 creation_id 供 debug
         return {"ok": False, "id": creation_id, "error": err2}
 
     return {"ok": True, "id": post_id}
