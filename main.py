@@ -18,7 +18,6 @@ from html import unescape
 from datetime import datetime, timezone, timedelta
 
 # ---------- Config ----------
-# 支援本地檔案或 URL (若為 URL，請以 https:// 開頭)
 OPML_PATH = os.getenv("OPML_PATH", "https://www.cwa.gov.tw/rss/channel.opml")
 RECORD_FILE = os.getenv("RECORD_FILE", "posted_records.json")
 GREETING_STATE_FILE = os.getenv("GREETING_STATE_FILE", "greeting_state.json")
@@ -27,6 +26,9 @@ MAX_SINGLE_POST_CHARS = int(os.getenv("MAX_SINGLE_POST_CHARS", "500"))
 USER_TIMEZONE = timezone(timedelta(hours=8))
 THREADS_API_ENDPOINT = os.getenv("THREADS_API_ENDPOINT", "")
 THREADS_API_TOKEN = os.getenv("THREADS_API_TOKEN", "")
+
+# 長浪圖片（使用使用者提供的 URL）
+SURGE_IMAGE_URL = os.getenv("SURGE_IMAGE_URL", "https://www.cwa.gov.tw/Data/warning/Surge_Swell/Swell_MapTaiwan02.png?v=2026030319-2")
 
 # ---------- Region mapping ----------
 REGION_MAP = {
@@ -40,7 +42,12 @@ REGION_MAP = {
 GREETINGS = {
     "morning": ["🌞 早安，祝你有美好的一天！", "🌞 早安，保持愉快心情！"],
     "noon": ["☀️ 午安，外出請注意天氣變化！", "☀️ 午安，祝你工作順利！"],
-    "night": ["🌙 晚安，注意保暖，祝你一夜好眠！", "🌙 晚安，保持安全，平安入睡！"]
+    "night": ["🌙 晚安，注意保暖，祝你一夜好眠！", "🌙 晚安，保持安全，平安入睡！"],
+    "surge": [
+        "🌊 海面湧浪強，外出活動請注意安全！",
+        "🌊 長浪來襲，請遠離海邊，保護自己與家人！",
+        "🌊 海象不佳，避免下水，保持警覺與平安！"
+    ]
 }
 
 # ---------- Persistence helpers ----------
@@ -56,13 +63,14 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 posted_records = load_json(RECORD_FILE, {"warnings": {}, "posts": {}})
-greeting_state = load_json(GREETING_STATE_FILE, {"morning": 0, "noon": 0, "night": 0})
+greeting_state = load_json(GREETING_STATE_FILE, {"morning": 0, "noon": 0, "night": 0, "surge": 0})
 
 # ---------- OPML parsing (support local file or URL) ----------
 def load_opml(opml_path_or_url):
     """
     支援本地檔案路徑或 URL。
     回傳 dict: { '今明天氣預報': {city: xmlUrl, ...}, '警報、特報': { ... } }
+    會處理一層或兩層 outline 嵌套。
     """
     try:
         if opml_path_or_url.startswith("http://") or opml_path_or_url.startswith("https://"):
@@ -79,21 +87,23 @@ def load_opml(opml_path_or_url):
     body = root.find("body")
     if body is None:
         return result
+
+    # 針對每個第一層 outline（例如 "今明天氣預報", "警報、特報"）
     for outline in body.findall("outline"):
-        title = outline.attrib.get("title", "")
+        title = outline.attrib.get("title", "") or outline.attrib.get("text", "")
         children = {}
-        # 直接子節點
+        # 先嘗試直接子節點有 xmlUrl 的情況
         for child in outline.findall("outline"):
             xmlUrl = child.attrib.get("xmlUrl")
             text = child.attrib.get("text") or child.attrib.get("title")
-            if xmlUrl:
+            if xmlUrl and text:
                 children[text] = xmlUrl
             else:
-                # 更深一層
+                # 處理更深一層（例如 outline -> outline -> outline）
                 for sub in child.findall("outline"):
                     xmlUrl = sub.attrib.get("xmlUrl")
                     text = sub.attrib.get("text") or sub.attrib.get("title")
-                    if xmlUrl:
+                    if xmlUrl and text:
                         children[text] = xmlUrl
         result[title] = children
     return result
@@ -189,17 +199,20 @@ def build_region_messages(city_weather_map, update_time):
             region_msgs[region] = header + "\n" + "\n".join(lines)
     return region_msgs
 
-# ---------- greeting pick ----------
-def pick_greeting(now=None):
+# ---------- greeting pick (supports different keys) ----------
+def pick_greeting(kind=None, now=None):
     if now is None:
         now = datetime.now(USER_TIMEZONE)
-    hour = now.hour
-    if 6 <= hour < 12:
-        key = "morning"
-    elif 12 <= hour < 18:
-        key = "noon"
+    if kind is None:
+        hour = now.hour
+        if 6 <= hour < 12:
+            key = "morning"
+        elif 12 <= hour < 18:
+            key = "noon"
+        else:
+            key = "night"
     else:
-        key = "night"
+        key = kind if kind in GREETINGS else "morning"
     idx = greeting_state.get(key, 0) % len(GREETINGS[key])
     greeting = GREETINGS[key][idx]
     greeting_state[key] = idx + 1
@@ -215,7 +228,6 @@ def post_to_api(content, attachments=None):
     """
     try:
         # 若要實作真實 API，請在此加入 requests.post 並帶入授權 header
-        # 範例：
         # headers = {"Authorization": f"Bearer {THREADS_API_TOKEN}"}
         # resp = requests.post(THREADS_API_ENDPOINT, json={"content": content}, headers=headers, timeout=10)
         # resp.raise_for_status()
@@ -272,8 +284,6 @@ def process_earthquake_item(item):
     pubDate = item.findtext("pubDate", "").strip()
     link = item.findtext("link", "").strip()
     description = item.findtext("description", "") or ""
-    is_significant = "E-A0015-001" in (title + description)
-    is_local = "E-A0016-001" in (title + description)
     image_url = None
     m = re.search(r'ReportImageURI[:=]\s*(https?://[^\s<]+)', description)
     if m:
@@ -305,6 +315,25 @@ def process_earthquake_item(item):
         print(f"[INFO] 已發佈地震: {title}")
     else:
         print(f"[ERROR] 發佈地震失敗，但已更新紀錄: {title}")
+
+# ---------- surge/swell processing ----------
+def process_surge_swell(image_url=SURGE_IMAGE_URL):
+    """
+    發佈長浪/海象提醒，固定使用 SURGE_IMAGE_URL（並加上時間戳避免快取）。
+    """
+    ts = int(time.time())
+    sep = "&" if "?" in image_url else "?"
+    image_with_ts = f"{image_url}{sep}v={ts}"
+    greeting = pick_greeting(kind="surge")
+    content = f"{greeting}\n\n📢 長浪/海象示意圖如下，請注意海邊活動安全。\n\n資料來源：中央氣象局"
+    resp = post_to_api(content, attachments=[image_with_ts])
+    key = f"surge||{datetime.now(USER_TIMEZONE).isoformat()}"
+    posted_records["posts"][key] = {"posted_at": datetime.now(USER_TIMEZONE).isoformat(), "post_id": resp.get("id") if resp.get("ok") else None, "error": resp.get("error") if not resp.get("ok") else None}
+    save_json(RECORD_FILE, posted_records)
+    if resp.get("ok"):
+        print("[INFO] 已發佈長浪/海象提醒")
+    else:
+        print("[ERROR] 發佈長浪/海象提醒失敗，但已更新紀錄")
 
 # ---------- weather pipeline ----------
 def run_weather_pipeline(opml_path):
@@ -380,7 +409,23 @@ def main():
         print(f"[FATAL] 載入 OPML 失敗: {e}")
         return
 
-    warnings_feed = opml.get("警報、特報", {}).get("警報、特報")
+    # 取出警報 feed：若子節點名稱與父節點相同，取第一個 value
+    warnings_map = opml.get("警報、特報", {})
+    # 可能 warnings_map = {"警報、特報": "https://..."} 或 {"警報、特報": {...}}
+    # 我們嘗試取得第一個 xmlUrl（value）
+    warnings_feed = None
+    if isinstance(warnings_map, dict):
+        # 如果 value 本身是字串（直接 xmlUrl），取第一個字串
+        for v in warnings_map.values():
+            if isinstance(v, str) and v.startswith("http"):
+                warnings_feed = v
+                break
+    if not warnings_feed:
+        # 嘗試取第一個子值（若子值是 dict）
+        first_val = next(iter(warnings_map.values()), None)
+        if isinstance(first_val, str) and first_val.startswith("http"):
+            warnings_feed = first_val
+
     if warnings_feed:
         try:
             process_warnings_feed(warnings_feed)
@@ -388,6 +433,12 @@ def main():
             print(f"[ERROR] 警特報 pipeline 發生未捕捉例外: {e}")
     else:
         print("[WARN] OPML 中找不到 警報、特報 RSS")
+
+    # 3) 長浪/海象提醒（可視情況啟動）
+    try:
+        process_surge_swell()
+    except Exception as e:
+        print(f"[ERROR] 長浪/海象 pipeline 發生例外: {e}")
 
 if __name__ == "__main__":
     main()
