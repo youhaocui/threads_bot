@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-簡化版 main.py（已修正）
-使用 Meta Threads API 的兩階段流程：
-1) POST /{user_id}/threads 建立 creation_id（可同時帶 text + media_type + image_url）
-2) POST /{user_id}/threads_publish 使用 creation_id 正式發布
-
-部署時請以環境變數提供 THREADS_ACCESS_TOKEN 與 THREADS_USER_ID
+main.py
+修正版：
+- 使用 Threads 簡化流程 (POST /{user_id}/threads + POST /{user_id}/threads_publish)
+- 啟動時避免重複發布舊 item（比對 posted_records 並只處理近期 item）
+- 只要有圖片就帶 media_type=IMAGE
+- 支援中央氣象署地震 JSON API（若設定 EARTHQUAKE_JSON_URL）
+- 改良天氣正則以匹配 "溫度: 15 ~ 20 降雨機率: 30%"
 """
 
 import os
@@ -18,52 +19,34 @@ import requests
 import xml.etree.ElementTree as ET
 from html import unescape
 from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ---------- Config ----------
+# ---------- Config (env) ----------
 OPML_PATH = os.getenv("OPML_PATH", "https://www.cwa.gov.tw/rss/channel.opml")
 FORCE_WARNINGS_RSS = os.getenv("FORCE_WARNINGS_RSS", "https://www.cwa.gov.tw/rss/Data/cwa_warning.xml")
 RECORD_FILE = os.getenv("RECORD_FILE", "posted_records.json")
 GREETING_STATE_FILE = os.getenv("GREETING_STATE_FILE", "greeting_state.json")
-POST_INTERVAL_SECONDS = int(os.getenv("POST_INTERVAL_SECONDS", "180"))
+POST_INTERVAL_SECONDS = int(os.getenv("POST_INTERVAL_SECONDS", "3"))
 MAX_SINGLE_POST_CHARS = int(os.getenv("MAX_SINGLE_POST_CHARS", "500"))
 USER_TIMEZONE = timezone(timedelta(hours=8))
-
-# Threads API config (from env)
 THREADS_ACCESS_TOKEN = os.getenv("THREADS_ACCESS_TOKEN", "")
 THREADS_USER_ID = os.getenv("THREADS_USER_ID", "")
-
-# 長浪圖片（可用環境變數覆蓋）
-SURGE_IMAGE_URL = os.getenv("SURGE_IMAGE_URL", "https://www.cwa.gov.tw/Data/warning/Surge_Swell/Swell_MapTaiwan02.png?v=2026030319-2")
-
-# Region map & greetings
-REGION_MAP = {
-    "北部": ["臺北市", "新北市", "基隆市", "桃園市", "新竹市", "新竹縣", "宜蘭縣"],
-    "中部": ["苗栗縣", "臺中市", "彰化縣", "南投縣", "雲林縣"],
-    "南部": ["嘉義市", "嘉義縣", "臺南市", "高雄市", "屏東縣"],
-    "東部": ["花蓮縣", "臺東縣"],
-    "外島": ["澎湖縣", "金門縣", "連江縣"]
-}
-
-GREETINGS = {
-    "morning": ["🌞 早安，祝你有美好的一天！", "🌞 早安，保持愉快心情！"],
-    "noon": ["☀️ 午安，外出請注意天氣變化！", "☀️ 午安，祝你工作順利！"],
-    "night": ["🌙 晚安，注意保暖，祝你一夜好眠！", "🌙 晚安，保持安全，平安入睡！"],
-    "surge": [
-        "🌊 海面湧浪強，外出活動請注意安全！",
-        "🌊 長浪來襲，請遠離海邊，保護自己與家人！",
-        "🌊 海象不佳，避免下水，保持警覺與平安！"
-    ]
-}
+SURGE_IMAGE_URL = os.getenv("SURGE_IMAGE_URL", "https://www.cwa.gov.tw/Data/warning/Surge_Swell/Swell_MapTaiwan02.png")
+EARTHQUAKE_JSON_URL = os.getenv("EARTHQUAKE_JSON_URL", "")  # optional: e.g. https://data.cwb.gov.tw/.../E-A0015-001.json
+RECENT_HOURS = int(os.getenv("RECENT_HOURS", "24"))  # only process items within this many hours
 
 # ---------- Persistence helpers ----------
 def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        logging.warning("讀取 JSON 失敗 (%s)，使用預設: %s", path, e)
         return default
 
 def save_json(path, data):
@@ -73,8 +56,21 @@ def save_json(path, data):
     except Exception as e:
         logging.error("保存 JSON 失敗: %s", e)
 
-posted_records = load_json(RECORD_FILE, {"warnings": {}, "posts": {}})
+posted_records = load_json(RECORD_FILE, {"warnings": {}, "posts": {}, "last_run": None})
 greeting_state = load_json(GREETING_STATE_FILE, {"morning": 0, "noon": 0, "night": 0, "surge": 0})
+
+# ---------- Utility ----------
+def now_local():
+    return datetime.now(USER_TIMEZONE)
+
+def parse_rss_pubdate(pubdate_str):
+    try:
+        dt = parsedate_to_datetime(pubdate_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(USER_TIMEZONE)
+    except Exception:
+        return None
 
 # ---------- OPML / RSS helpers ----------
 def load_opml(opml_path_or_url):
@@ -122,51 +118,17 @@ def get_items_from_rss(root):
         return []
     return channel.findall("item")
 
-# ---------- description parsing ----------
-SEGMENT_HEADERS = ["今日白天", "今晚明晨", "明日白天", "今日", "今晚", "明日"]
+# ---------- Text / parsing helpers ----------
+def clean_text(s: str) -> str:
+    if not s:
+        return ""
+    s = s.replace("\\n", " ").replace("\n", " ").replace("\r", " ")
+    return re.sub(r"\s+", " ", s).strip()
 
-def split_description_into_segments(description_html):
-    text = unescape(re.sub(r"<[^>]+>", "", description_html)).strip()
-    segments = {}
-    pattern = r"(今日白天|今晚明晨|明日白天|今日|今晚|明日)"
-    parts = re.split(pattern, text)
-    if len(parts) <= 1:
-        segments["full"] = text
-        return segments
-    i = 0
-    while i < len(parts):
-        if parts[i] == "":
-            i += 1
-            continue
-        if re.match(pattern, parts[i]):
-            header = parts[i]
-            content = parts[i+1] if i+1 < len(parts) else ""
-            segments[header] = content.strip()
-            i += 2
-        else:
-            segments.setdefault("pre", "")
-            segments["pre"] += parts[i].strip()
-            i += 1
-    return segments
-
-def choose_segment_by_time(segments, now=None):
-    if now is None:
-        now = datetime.now(USER_TIMEZONE)
-    hour = now.hour
-    is_day = 6 <= hour < 18
-    if is_day:
-        for key in ["今晚明晨", "今晚", "明日白天", "明日", "full"]:
-            if key in segments:
-                return key, segments[key]
-    else:
-        for key in ["明日白天", "明日", "今晚明晨", "今晚", "full"]:
-            if key in segments:
-                return key, segments[key]
-    return "full", segments.get("full", "")
-
-# ---------- extract temp and rain ----------
+# 改良正則：支援 "溫度: 15 ~ 20 降雨機率: 30%"
 TEMP_RAIN_PATTERN = re.compile(
-    r"(?P<city>[\u4e00-\u9fff\w\s\(\)]+)[：:]\s*(?P<temp_low>\d{1,2})\s*[-~]\s*(?P<temp_high>\d{1,2})\s*°?C.*?降雨機率[：:]\s*(?P<rain>\d{1,3})\s*%?"
+    r"(?P<city>[\u4e00-\u9fff\w\s\(\)]+).*?溫度[:：]\s*(?P<temp_low>\d{1,2})\s*[~\-]\s*(?P<temp_high>\d{1,2}).*?降雨機率[:：]\s*(?P<rain>\d{1,3})\s*%?",
+    re.S
 )
 
 def extract_city_weather_from_text(text):
@@ -177,34 +139,39 @@ def extract_city_weather_from_text(text):
         high = m.group("temp_high")
         rain = m.group("rain")
         results[city] = {"temp": f"{low}-{high}°C", "rain": f"{rain}%"}
+    # fallback: try simpler pattern "城市 溫度: 15 ~ 20"
     if not results:
-        alt_pattern = re.compile(
-            r"(?P<city>[\u4e00-\u9fff\w\s\(\)]+)\s+(?P<temp_low>\d{1,2})\s*[~\-]\s*(?P<temp_high>\d{1,2})\s*°?C.*?降雨機率\s*(?P<rain>\d{1,3})\s*%?"
-        )
-        for m in alt_pattern.finditer(text):
+        alt = re.compile(r"(?P<city>[\u4e00-\u9fff\w\s\(\)]+)\s+溫度[:：]\s*(?P<low>\d{1,2})\s*[~\-]\s*(?P<high>\d{1,2})", re.S)
+        for m in alt.finditer(text):
             city = m.group("city").strip()
-            low = m.group("temp_low")
-            high = m.group("temp_high")
-            rain = m.group("rain")
-            results[city] = {"temp": f"{low}-{high}°C", "rain": f"{rain}%"}
+            low = m.group("low")
+            high = m.group("high")
+            results[city] = {"temp": f"{low}-{high}°C", "rain": "N/A"}
     return results
 
-def build_region_messages(city_weather_map, update_time):
-    region_msgs = {}
-    for region, cities in REGION_MAP.items():
-        lines = []
-        for city in cities:
-            if city in city_weather_map:
-                w = city_weather_map[city]
-                lines.append(f"{city}：{w['temp']}，降雨機率：{w['rain']}")
-        if lines:
-            header = f"🌤 今日{region}地區天氣 ({update_time})"
-            region_msgs[region] = header + "\n" + "\n".join(lines)
-    return region_msgs
+# ---------- Greetings ----------
+REGION_MAP = {
+    "北部": ["臺北市", "新北市", "基隆市", "桃園市", "新竹市", "新竹縣", "宜蘭縣"],
+    "中部": ["苗栗縣", "臺中市", "彰化縣", "南投縣", "雲林縣"],
+    "南部": ["嘉義市", "嘉義縣", "臺南市", "高雄市", "屏東縣"],
+    "東部": ["花蓮縣", "臺東縣"],
+    "外島": ["澎湖縣", "金門縣", "連江縣"]
+}
+
+GREETINGS = {
+    "morning": ["🌞 早安，祝你有美好的一天！", "🌞 早安，保持愉快心情！"],
+    "noon": ["☀️ 午安，外出請注意天氣變化！", "☀️ 午安，祝你工作順利！"],
+    "night": ["🌙 晚安，注意保暖，祝你一夜好眠！", "🌙 晚安，保持安全，平安入睡！"],
+    "surge": [
+        "🌊 海面湧浪強，外出活動請注意安全！",
+        "🌊 長浪來襲，請遠離海邊，保護自己與家人！",
+        "🌊 海象不佳，避免下水，保持警覺與平安！"
+    ]
+}
 
 def pick_greeting(kind=None, now=None):
     if now is None:
-        now = datetime.now(USER_TIMEZONE)
+        now = now_local()
     if kind is None:
         hour = now.hour
         if 6 <= hour < 12:
@@ -221,18 +188,13 @@ def pick_greeting(kind=None, now=None):
     save_json(GREETING_STATE_FILE, greeting_state)
     return greeting
 
-# ---------- Simplified Threads API helpers (threads + threads_publish) ----------
+# ---------- Threads API (simplified two-step) ----------
 BASE_THREADS = "https://graph.threads.net/v1.0"
 
 def _auth_params():
     return {"access_token": THREADS_ACCESS_TOKEN}
 
 def _create_creation(text, image_url=None):
-    """
-    使用 POST /{user_id}/threads 建立 creation（回傳 creation_id）
-    使用 form-data (data=) 與 params=auth。
-    確保：若有 image_url，一定同時帶 media_type=IMAGE。
-    """
     if not THREADS_USER_ID or not THREADS_ACCESS_TOKEN:
         logging.debug("Threads credentials not set for create_creation.")
         return None, "no_credentials"
@@ -262,9 +224,6 @@ def _create_creation(text, image_url=None):
         return None, str(e)
 
 def _publish_creation(creation_id):
-    """
-    使用 POST /{user_id}/threads_publish 發布 creation（帶 creation_id）
-    """
     if not THREADS_USER_ID or not THREADS_ACCESS_TOKEN:
         logging.debug("Threads credentials not set for publish_creation.")
         return None, "no_credentials"
@@ -288,14 +247,6 @@ def _publish_creation(creation_id):
         return None, str(e)
 
 def post_to_api(content, attachments=None):
-    """
-    簡化版發文（支援文字 + 單張圖片）
-    - attachments: list of image URLs (只取第一張)
-    流程：
-      1) POST /{user_id}/threads (帶 text + media_type + image_url)
-      2) POST /{user_id}/threads_publish (帶 creation_id)
-    回傳 dict {"ok": bool, "id": post_id_or_creation_id, "error": str_or_None}
-    """
     if not THREADS_ACCESS_TOKEN or not THREADS_USER_ID:
         logging.info("THREADS credentials not set — using mock post.")
         return {"ok": True, "id": f"mock-{int(time.time())}"}
@@ -317,22 +268,40 @@ def post_to_api(content, attachments=None):
 
     return {"ok": True, "id": post_id}
 
-# ---------- warnings feed processing (with surge detection) ----------
+# ---------- Warnings feed processing (robust) ----------
+def is_recent(pub_dt):
+    if not pub_dt:
+        return False
+    cutoff = now_local() - timedelta(hours=RECENT_HOURS)
+    return pub_dt >= cutoff
+
 def process_warnings_feed(warnings_url):
     try:
         root = fetch_rss_xml(warnings_url)
     except Exception as e:
         logging.warning("下載警報 RSS 失敗: %s", e)
         return
+
     items = get_items_from_rss(root)
+    logging.info("警報 RSS 共 %d 筆 item，已記錄 %d 筆", len(items), len(posted_records.get("warnings", {})))
     for item in items:
         try:
-            title = item.findtext("title", "").strip()
-            pubDate = item.findtext("pubDate", "").strip()
-            link = item.findtext("link", "").strip()
+            title_raw = item.findtext("title", "") or ""
+            title = clean_text(title_raw)
+            pubDate_raw = item.findtext("pubDate", "") or ""
+            pub_dt = parse_rss_pubdate(pubDate_raw)
+            link = item.findtext("link", "") or ""
             description = item.findtext("description", "") or ""
-            key = f"{title}||{pubDate}"
-            if key in posted_records["warnings"]:
+            key = f"{title}||{pubDate_raw}"
+
+            # skip if already posted
+            if key in posted_records.get("warnings", {}):
+                logging.debug("已發佈，跳過: %s", title)
+                continue
+
+            # skip if too old (avoid re-posting on startup)
+            if not is_recent(pub_dt):
+                logging.debug("跳過舊的 item (不在最近 %d 小時): %s", RECENT_HOURS, title)
                 continue
 
             desc_plain = unescape(re.sub(r"<[^>]+>", "", description)).strip()
@@ -343,6 +312,7 @@ def process_warnings_feed(warnings_url):
                 image_url = SURGE_IMAGE_URL
                 greeting = pick_greeting(kind="surge")
             else:
+                # try to find image in description or enclosure
                 m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', description)
                 if m:
                     image_url = m.group(1)
@@ -358,10 +328,11 @@ def process_warnings_feed(warnings_url):
 
             content = f"{greeting}\n\n🚨 {title}\n\n{desc_plain}\n\n官方連結：{link}"
             attachments = [image_url] if image_url else None
+
             resp = post_to_api(content, attachments=attachments)
 
-            posted_records["warnings"][key] = {
-                "posted_at": datetime.now(USER_TIMEZONE).isoformat(),
+            posted_records.setdefault("warnings", {})[key] = {
+                "posted_at": now_local().isoformat(),
                 "post_id": resp.get("id") if resp.get("ok") else None,
                 "error": resp.get("error") if not resp.get("ok") else None
             }
@@ -371,54 +342,95 @@ def process_warnings_feed(warnings_url):
                 logging.info("已發佈警報: %s", title)
             else:
                 logging.error("發文失敗，但已更新紀錄: %s / error: %s", title, resp.get("error"))
+
+            time.sleep(POST_INTERVAL_SECONDS)
         except Exception as e:
             logging.error("處理某筆警報時發生例外: %s", e)
             continue
 
-# ---------- earthquake item processing ----------
-def process_earthquake_item(item):
-    title = item.findtext("title", "").strip()
-    pubDate = item.findtext("pubDate", "").strip()
-    link = item.findtext("link", "").strip()
-    description = item.findtext("description", "") or ""
-    image_url = None
-    m = re.search(r'ReportImageURI[:=]\s*(https?://[^\s<]+)', description)
-    if m:
-        image_url = m.group(1)
-    else:
-        m2 = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', description)
-        if m2:
-            image_url = m2.group(1)
-    if image_url:
-        ts = int(time.time())
-        sep = "&" if "?" in image_url else "?"
-        image_url = f"{image_url}{sep}v={ts}"
-    plain = unescape(re.sub(r"<[^>]+>", "", description)).strip()
-    if len(plain) <= MAX_SINGLE_POST_CHARS:
-        content = f"🌏 {title}\n\n{plain}\n\n官方連結：{link}"
-    else:
-        mmax = re.search(r"最大震度[:：]?\s*([^\s，。]+)", plain)
-        if mmax:
-            max_info = mmax.group(1)
-        else:
-            max_info = title
-        content = f"🌏 {title}\n\n最大震度：{max_info}\n\n詳情請見官方連結：{link}"
-    attachments = [image_url] if image_url else None
-    resp = post_to_api(content, attachments=attachments)
-    key = f"{title}||{pubDate}"
-    posted_records["warnings"][key] = {"posted_at": datetime.now(USER_TIMEZONE).isoformat(), "post_id": resp.get("id") if resp.get("ok") else None, "error": resp.get("error") if not resp.get("ok") else None}
-    save_json(RECORD_FILE, posted_records)
-    if resp.get("ok"):
-        logging.info("已發佈地震: %s", title)
-    else:
-        logging.error("發佈地震失敗，但已更新紀錄: %s", title)
+# ---------- Earthquake JSON processing (optional) ----------
+def process_earthquake_json_url(json_url):
+    if not json_url:
+        return
+    try:
+        resp = requests.get(json_url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logging.warning("下載地震 JSON 失敗: %s", e)
+        return
 
-# ---------- weather pipeline ----------
+    # data structure may vary; try to find records
+    records = data.get("records") or data.get("result") or data.get("Earthquake") or []
+    # if top-level has Earthquake list under records->Earthquake
+    if isinstance(records, dict) and "Earthquake" in records:
+        records = records["Earthquake"]
+
+    for rec in records:
+        try:
+            # prefer ReportContent and ReportImageURI if present
+            report_content = rec.get("ReportContent") or rec.get("ReportRemark") or rec.get("ReportContent")
+            report_image = rec.get("ReportImageURI") or rec.get("ReportImageURI") or rec.get("ShakemapImageURI")
+            web = rec.get("Web") or rec.get("web") or ""
+            eq_no = rec.get("EarthquakeNo") or rec.get("EarthquakeID") or str(time.time())
+            title = rec.get("ReportType", "地震報告")
+            key = f"{title}||{eq_no}"
+            if key in posted_records.get("warnings", {}):
+                logging.debug("地震已發佈，跳過: %s", key)
+                continue
+
+            content = f"🌏 {title}\n\n{report_content}\n\n官方連結：{web}"
+            attachments = None
+            if report_image:
+                ts = int(time.time())
+                sep = "&" if "?" in report_image else "?"
+                attachments = [f"{report_image}{sep}v={ts}"]
+
+            resp = post_to_api(content, attachments=attachments)
+            posted_records.setdefault("warnings", {})[key] = {
+                "posted_at": now_local().isoformat(),
+                "post_id": resp.get("id") if resp.get("ok") else None,
+                "error": resp.get("error") if not resp.get("ok") else None
+            }
+            save_json(RECORD_FILE, posted_records)
+
+            if resp.get("ok"):
+                logging.info("已發佈地震: %s", key)
+            else:
+                logging.error("發佈地震失敗，但已更新紀錄: %s / error: %s", key, resp.get("error"))
+            time.sleep(POST_INTERVAL_SECONDS)
+        except Exception as e:
+            logging.error("處理地震紀錄時發生例外: %s", e)
+            continue
+
+# ---------- Weather pipeline ----------
+def build_region_messages(city_weather_map, update_time):
+    region_msgs = {}
+    for region, cities in REGION_MAP.items():
+        lines = []
+        for city in cities:
+            if city in city_weather_map:
+                w = city_weather_map[city]
+                lines.append(f"{city}：{w['temp']}，降雨機率：{w.get('rain','N/A')}")
+        if lines:
+            header = f"🌤 今日{region}地區天氣 ({update_time})"
+            region_msgs[region] = header + "\n" + "\n".join(lines)
+    return region_msgs
+
 def run_weather_pipeline(opml_path):
-    opml = load_opml(opml_path)
+    try:
+        opml = load_opml(opml_path)
+    except Exception as e:
+        logging.error("載入 OPML 失敗: %s", e)
+        return
+
     forecast_map = opml.get("今明天氣預報", {})
+    if not forecast_map:
+        logging.warning("OPML 中找不到 今明天氣預報")
+        return
+
     city_weather_map = {}
-    update_time_str = datetime.now(USER_TIMEZONE).strftime("%m月%d日 %H:%M 更新")
+    update_time_str = now_local().strftime("%m月%d日 %H:%M 更新")
     for city, url in forecast_map.items():
         try:
             root = fetch_rss_xml(url)
@@ -427,33 +439,38 @@ def run_weather_pipeline(opml_path):
                 continue
             item = items[0]
             description = item.findtext("description", "") or ""
-            segments = split_description_into_segments(description)
-            seg_key, seg_text = choose_segment_by_time(segments)
-            extracted = extract_city_weather_from_text(seg_text)
-            if not extracted:
-                extracted = extract_city_weather_from_text(description)
-            if city in extracted:
+            segments_text = unescape(re.sub(r"<[^>]+>", "", description)).strip()
+            extracted = extract_city_weather_from_text(segments_text)
+            if extracted and city in extracted:
                 city_weather_map[city] = extracted[city]
             else:
+                # fallback: if any extracted, pick first; else use raw description as fallback
                 if extracted:
                     first_city = next(iter(extracted))
                     city_weather_map[city] = extracted[first_city]
                 else:
-                    logging.warning("無法從 %s 的 RSS 解析出溫度/降雨資訊", city)
+                    # fallback to raw short summary
+                    plain = segments_text.strip()
+                    if plain:
+                        city_weather_map[city] = {"temp": "N/A", "rain": "N/A"}
+                    else:
+                        logging.debug("無法從 %s 的 RSS 解析出溫度/降雨資訊", city)
         except Exception as e:
             logging.error("下載或解析 %s RSS 失敗: %s", city, e)
             continue
+
     region_msgs = build_region_messages(city_weather_map, update_time_str)
     if not region_msgs:
         logging.warning("未取得任何區域天氣資料")
         return
-    combined_text = "\n\n".join(region_msgs.values())
+
     greeting = pick_greeting()
+    combined_text = "\n\n".join(region_msgs.values())
     if len(combined_text) <= MAX_SINGLE_POST_CHARS:
-        content = f"{greeting}\n\n{combined_text}\n\n詳細報告：https://www.cwa.gov.tw/..."
+        content = f"{greeting}\n\n{combined_text}\n\n詳細報告：https://www.cwa.gov.tw/"
         resp = post_to_api(content)
-        key = f"weather_all||{datetime.now(USER_TIMEZONE).isoformat()}"
-        posted_records["posts"][key] = {"posted_at": datetime.now(USER_TIMEZONE).isoformat(), "post_id": resp.get("id") if resp.get("ok") else None, "error": resp.get("error") if not resp.get("ok") else None}
+        key = f"weather_all||{now_local().isoformat()}"
+        posted_records.setdefault("posts", {})[key] = {"posted_at": now_local().isoformat(), "post_id": resp.get("id") if resp.get("ok") else None, "error": resp.get("error") if not resp.get("ok") else None}
         save_json(RECORD_FILE, posted_records)
         if resp.get("ok"):
             logging.info("已發佈合併天氣貼文")
@@ -461,10 +478,10 @@ def run_weather_pipeline(opml_path):
             logging.error("發佈合併天氣貼文失敗，但已更新紀錄")
     else:
         for region, msg in region_msgs.items():
-            content = f"{greeting}\n\n{msg}\n\n詳細報告：https://www.cwa.gov.tw/..."
+            content = f"{greeting}\n\n{msg}\n\n詳細報告：https://www.cwa.gov.tw/"
             resp = post_to_api(content)
-            key = f"weather_{region}||{datetime.now(USER_TIMEZONE).isoformat()}"
-            posted_records["posts"][key] = {"posted_at": datetime.now(USER_TIMEZONE).isoformat(), "post_id": resp.get("id") if resp.get("ok") else None, "error": resp.get("error") if not resp.get("ok") else None}
+            key = f"weather_{region}||{now_local().isoformat()}"
+            posted_records.setdefault("posts", {})[key] = {"posted_at": now_local().isoformat(), "post_id": resp.get("id") if resp.get("ok") else None, "error": resp.get("error") if not resp.get("ok") else None}
             save_json(RECORD_FILE, posted_records)
             if resp.get("ok"):
                 logging.info("已發佈 %s 天氣貼文", region)
@@ -474,15 +491,21 @@ def run_weather_pipeline(opml_path):
 
 # ---------- main ----------
 def main():
-    # 1) 天氣 pipeline
+    logging.info("啟動，已載入已發佈紀錄數: %d warnings, %d posts", len(posted_records.get("warnings", {})), len(posted_records.get("posts", {})))
+
+    # 1) optional: earthquake JSON feed
+    if EARTHQUAKE_JSON_URL:
+        logging.info("嘗試處理地震 JSON: %s", EARTHQUAKE_JSON_URL)
+        process_earthquake_json_url(EARTHQUAKE_JSON_URL)
+
+    # 2) weather pipeline
     try:
         run_weather_pipeline(OPML_PATH)
     except Exception as e:
         logging.error("天氣 pipeline 發生未捕捉例外: %s", e)
 
-    # 2) 警特報 pipeline（優先使用 FORCE_WARNINGS_RSS）
+    # 3) warnings pipeline (use FORCE_WARNINGS_RSS if set)
     warnings_feed = FORCE_WARNINGS_RSS or None
-
     if not warnings_feed:
         try:
             opml = load_opml(OPML_PATH)
@@ -499,6 +522,11 @@ def main():
             logging.error("警特報 pipeline 發生未捕捉例外: %s", e)
     else:
         logging.warning("OPML 中找不到 警報、特報 RSS")
+
+    # update last_run
+    posted_records["last_run"] = now_local().isoformat()
+    save_json(RECORD_FILE, posted_records)
+    logging.info("結束執行")
 
 if __name__ == "__main__":
     main()
