@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
 main.py
 完整程式碼：從 OPML (本地檔或 URL) 讀取中央氣象署 RSS，處理天氣、警特報、地震，
@@ -27,7 +26,7 @@ USER_TIMEZONE = timezone(timedelta(hours=8))
 THREADS_API_ENDPOINT = os.getenv("THREADS_API_ENDPOINT", "")
 THREADS_API_TOKEN = os.getenv("THREADS_API_TOKEN", "")
 
-# 長浪圖片（使用使用者提供的 URL）
+# 長浪圖片（預設為你指定的 URL，可用環境變數覆蓋）
 SURGE_IMAGE_URL = os.getenv("SURGE_IMAGE_URL", "https://www.cwa.gov.tw/Data/warning/Surge_Swell/Swell_MapTaiwan02.png?v=2026030319-2")
 
 # ---------- Region mapping ----------
@@ -163,8 +162,9 @@ def choose_segment_by_time(segments, now=None):
     return "full", segments.get("full", "")
 
 # ---------- extract temp and rain ----------
+# 更寬鬆的 regex，容忍中間雜訊
 TEMP_RAIN_PATTERN = re.compile(
-    r"(?P<city>[\u4e00-\u9fff\w\s\(\)]+)[：:]\s*(?P<temp_low>\d{1,2})\s*[-~]\s*(?P<temp_high>\d{1,2})\s*°?C[，,]?\s*降雨機率[：:]\s*(?P<rain>\d{1,3})\s*%?"
+    r"(?P<city>[\u4e00-\u9fff\w\s\(\)]+)[：:]\s*(?P<temp_low>\d{1,2})\s*[-~]\s*(?P<temp_high>\d{1,2})\s*°?C.*?降雨機率[：:]\s*(?P<rain>\d{1,3})\s*%?"
 )
 
 def extract_city_weather_from_text(text):
@@ -176,7 +176,9 @@ def extract_city_weather_from_text(text):
         rain = m.group("rain")
         results[city] = {"temp": f"{low}-{high}°C", "rain": f"{rain}%"}
     if not results:
-        alt_pattern = re.compile(r"(?P<city>[\u4e00-\u9fff\w\s\(\)]+)\s+(?P<temp_low>\d{1,2})\s*[~\-]\s*(?P<temp_high>\d{1,2})\s*°?C.*?降雨機率\s*(?P<rain>\d{1,3})\s*%?")
+        alt_pattern = re.compile(
+            r"(?P<city>[\u4e00-\u9fff\w\s\(\)]+)\s+(?P<temp_low>\d{1,2})\s*[~\-]\s*(?P<temp_high>\d{1,2})\s*°?C.*?降雨機率\s*(?P<rain>\d{1,3})\s*%?"
+        )
         for m in alt_pattern.finditer(text):
             city = m.group("city").strip()
             low = m.group("temp_low")
@@ -228,6 +230,7 @@ def post_to_api(content, attachments=None):
     """
     try:
         # 若要實作真實 API，請在此加入 requests.post 並帶入授權 header
+        # 範例（Threads API 假設）：
         # headers = {"Authorization": f"Bearer {THREADS_API_TOKEN}"}
         # resp = requests.post(THREADS_API_ENDPOINT, json={"content": content}, headers=headers, timeout=10)
         # resp.raise_for_status()
@@ -349,6 +352,8 @@ def run_weather_pipeline(opml_path):
                 continue
             item = items[0]
             description = item.findtext("description", "") or ""
+            # debug: 若需要檢查 description，取消下一行註解
+            # print(f"[DEBUG] {city} description:\n{description}\n---")
             segments = split_description_into_segments(description)
             seg_key, seg_text = choose_segment_by_time(segments)
             extracted = extract_city_weather_from_text(seg_text)
@@ -411,17 +416,15 @@ def main():
 
     # 取出警報 feed：若子節點名稱與父節點相同，取第一個 value
     warnings_map = opml.get("警報、特報", {})
-    # 可能 warnings_map = {"警報、特報": "https://..."} 或 {"警報、特報": {...}}
-    # 我們嘗試取得第一個 xmlUrl（value）
     warnings_feed = None
     if isinstance(warnings_map, dict):
-        # 如果 value 本身是字串（直接 xmlUrl），取第一個字串
+        # 可能是 {"警報、特報": "https://..."} 或 {"警報、特報": {...}}
+        # 優先取第一個字串型的 URL
         for v in warnings_map.values():
             if isinstance(v, str) and v.startswith("http"):
                 warnings_feed = v
                 break
     if not warnings_feed:
-        # 嘗試取第一個子值（若子值是 dict）
         first_val = next(iter(warnings_map.values()), None)
         if isinstance(first_val, str) and first_val.startswith("http"):
             warnings_feed = first_val
