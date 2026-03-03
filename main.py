@@ -4,9 +4,9 @@
 main.py
 從中央氣象署 OPML / RSS 讀取天氣與警特報，處理天氣分區發文、警報逐筆發文（含長浪判斷與圖片）、地震處理、發文紀錄與錯誤處理。
 部署時請以環境變數或 config.json 提供實際 API 設定（THREADS_API_ENDPOINT / THREADS_ACCESS_TOKEN / THREADS_USER_ID）。
-發文流程已改為 Threads 的兩階段機制：
-  1) POST /{user_id}/threads 建立 creation container（可帶 text 與 image_url）
-  2) POST /{user_id}/threads_publish 使用 creation_id 發布
+發文流程已改為 Threads Graph API 的正確流程：
+  - 圖片：POST /{user_id}/media -> 取得 media id -> POST /{user_id}/posts with attached_media
+  - 純文字：POST /{user_id}/posts with message
 """
 
 import os
@@ -31,10 +31,11 @@ GREETING_STATE_FILE = os.getenv("GREETING_STATE_FILE", "greeting_state.json")
 POST_INTERVAL_SECONDS = int(os.getenv("POST_INTERVAL_SECONDS", "180"))
 MAX_SINGLE_POST_CHARS = int(os.getenv("MAX_SINGLE_POST_CHARS", "500"))
 USER_TIMEZONE = timezone(timedelta(hours=8))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 
 # Threads API config (set these in your environment)
-# If THREADS_API_ENDPOINT is empty, default to the known base
-THREADS_API_ENDPOINT = os.getenv("THREADS_API_ENDPOINT", "").rstrip("/") or "https://graph.threads.net/v1.0"
+# Base endpoint (default to official base)
+THREADS_API_ENDPOINT = os.getenv("THREADS_API_ENDPOINT", "https://graph.threads.net/v1.0").rstrip("/")
 THREADS_ACCESS_TOKEN = os.getenv("THREADS_ACCESS_TOKEN", "")
 THREADS_USER_ID = os.getenv("THREADS_USER_ID", "")
 
@@ -83,7 +84,7 @@ greeting_state = load_json(GREETING_STATE_FILE, {"morning": 0, "noon": 0, "night
 def load_opml(opml_path_or_url):
     try:
         if opml_path_or_url.startswith("http://") or opml_path_or_url.startswith("https://"):
-            resp = requests.get(opml_path_or_url, timeout=15)
+            resp = requests.get(opml_path_or_url, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             root = ET.fromstring(resp.content)
         else:
@@ -227,113 +228,129 @@ def pick_greeting(kind=None, now=None):
     save_json(GREETING_STATE_FILE, greeting_state)
     return greeting
 
-# ---------- Threads two-stage publish helpers ----------
-def _user_threads_endpoint():
-    """Return /{user_id}/threads endpoint"""
-    return f"{THREADS_API_ENDPOINT.rstrip('/')}/{THREADS_USER_ID}/threads"
+# ---------- Threads API helpers (correct /media and /posts flow) ----------
+def _user_media_endpoint():
+    """Return /{user_id}/media endpoint"""
+    return f"{THREADS_API_ENDPOINT}/{THREADS_USER_ID}/media"
 
-def _user_threads_publish_endpoint():
-    """Return /{user_id}/threads_publish endpoint"""
-    return f"{THREADS_API_ENDPOINT.rstrip('/')}/{THREADS_USER_ID}/threads_publish"
+def _user_posts_endpoint():
+    """Return /{user_id}/posts endpoint"""
+    return f"{THREADS_API_ENDPOINT}/{THREADS_USER_ID}/posts"
 
 def _auth_headers():
     return {"Authorization": f"Bearer {THREADS_ACCESS_TOKEN}"}
 
-def create_thread_container(text, image_url=None):
+def upload_media(image_url):
     """
-    Create a creation container via POST /{user_id}/threads.
-    If image_url is provided, include media_type=IMAGE and image_url.
-    Returns creation_id (id) on success, or None on failure.
+    Upload an image URL to /{user_id}/media and return media id.
+    If the API requires multipart upload, this function can be adapted to download
+    the image and upload as files={'file': ...}.
     """
     if not THREADS_ACCESS_TOKEN or not THREADS_USER_ID:
-        logging.error("THREADS_ACCESS_TOKEN or THREADS_USER_ID not set; cannot create thread container.")
+        logging.error("沒有 THREADS_ACCESS_TOKEN 或 THREADS_USER_ID，無法上傳媒體")
         return None
 
-    url = _user_threads_endpoint()
+    media_endpoint = _user_media_endpoint()
     headers = _auth_headers()
-    payload = {"text": text}
-    if image_url:
-        payload.update({"media_type": "IMAGE", "image_url": image_url})
-    else:
-        payload.update({"media_type": "TEXT"})
+    payload = {"image_url": image_url}
 
     try:
-        resp = requests.post(url, headers=headers, data=payload, timeout=20)
+        resp = requests.post(media_endpoint, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
         if resp.status_code >= 400:
-            # try to log JSON error body if present
             try:
-                logging.error("create_thread_container error: %s", resp.json())
+                logging.error("upload_media error: %s", resp.json())
             except Exception:
-                logging.error("create_thread_container error: %s", resp.text)
+                logging.error("upload_media error: %s", resp.text)
             resp.raise_for_status()
         data = resp.json() if resp.content else {}
-        creation_id = data.get("id") or data.get("creation_id")
-        if not creation_id:
-            logging.error("create_thread_container: no creation id returned: %s", data)
+        media_id = data.get("id") or data.get("media_fbid") or data.get("fbid")
+        if not media_id:
+            logging.error("上傳媒體成功但回傳沒有 media id: %s", data)
             return None
-        return creation_id
+        return media_id
     except Exception as e:
-        logging.error("建立 creation container 失敗: %s", e)
+        logging.error("上傳媒體失敗: %s (url=%s)", e, image_url)
         return None
-
-def publish_thread(creation_id):
-    """
-    Publish a previously created container via POST /{user_id}/threads_publish.
-    Returns True on success, False on failure.
-    """
-    if not THREADS_ACCESS_TOKEN or not THREADS_USER_ID:
-        logging.error("THREADS_ACCESS_TOKEN or THREADS_USER_ID not set; cannot publish thread.")
-        return False
-
-    url = _user_threads_publish_endpoint()
-    headers = _auth_headers()
-    payload = {"creation_id": creation_id}
-
-    try:
-        resp = requests.post(url, headers=headers, data=payload, timeout=20)
-        if resp.status_code >= 400:
-            try:
-                logging.error("publish_thread error: %s", resp.json())
-            except Exception:
-                logging.error("publish_thread error: %s", resp.text)
-            resp.raise_for_status()
-        return True
-    except Exception as e:
-        logging.error("publish_thread 失敗: %s", e)
-        return False
 
 def post_to_api(content, attachments=None):
     """
-    Unified posting function using Threads two-stage flow:
-      - If THREADS_API_ENDPOINT / ACCESS_TOKEN / USER_ID not set -> mock
-      - Try to create container with image_url (if attachments provided)
-      - Then publish using creation_id
-    attachments: list of image URLs (we use the first valid one)
+    Unified posting function using Threads Graph API:
+      - If env not set -> mock
+      - If attachments provided -> upload media first, then post with attached_media
+      - Else -> post text-only with message
+    Returns dict: {"ok": bool, "id": str or None, "error": str or None}
     """
     if not THREADS_API_ENDPOINT or not THREADS_ACCESS_TOKEN or not THREADS_USER_ID:
         logging.info("Threads config missing; using mock post.")
         return {"ok": True, "id": f"mock-{int(time.time())}"}
 
-    image_url = None
-    if attachments:
-        # prefer first non-empty URL
-        for u in attachments:
-            if u:
-                image_url = u
-                break
+    headers = _auth_headers()
+    posts_endpoint = _user_posts_endpoint()
 
-    creation_id = create_thread_container(content, image_url=image_url)
-    if not creation_id:
-        logging.error("建立發文容器失敗，無法發文")
-        return {"ok": False, "error": "create_container_failed"}
+    # Text-only post
+    if not attachments:
+        payload = {"message": content}
+        try:
+            resp = requests.post(posts_endpoint, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+            if resp.status_code >= 400:
+                try:
+                    logging.error("post_text error: %s", resp.json())
+                except Exception:
+                    logging.error("post_text error: %s", resp.text)
+                resp.raise_for_status()
+            data = resp.json() if resp.content else {}
+            post_id = data.get("id") or data.get("post_id") or data.get("thread_id")
+            return {"ok": True, "id": post_id or f"unknown-{int(time.time())}"}
+        except Exception as e:
+            logging.error("發送文字貼文失敗: %s", e)
+            return {"ok": False, "error": str(e)}
 
-    ok = publish_thread(creation_id)
-    if not ok:
-        logging.error("發佈步驟失敗 (creation_id=%s)", creation_id)
-        return {"ok": False, "error": "publish_failed"}
+    # With attachments: upload first (use first valid URL)
+    media_fbids = []
+    for url in attachments:
+        if not url:
+            continue
+        media_id = upload_media(url)
+        if media_id:
+            media_fbids.append(media_id)
+        else:
+            logging.warning("某張媒體上傳失敗，將跳過: %s", url)
 
-    logging.info("發文成功 (creation_id=%s)", creation_id)
-    return {"ok": True, "id": creation_id}
+    if not media_fbids:
+        logging.error("所有媒體上傳皆失敗，改以純文字發文")
+        # fallback to text-only post
+        payload = {"message": content}
+        try:
+            resp = requests.post(posts_endpoint, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+            if resp.status_code >= 400:
+                try:
+                    logging.error("post_text fallback error: %s", resp.json())
+                except Exception:
+                    logging.error("post_text fallback error: %s", resp.text)
+                resp.raise_for_status()
+            data = resp.json() if resp.content else {}
+            post_id = data.get("id") or data.get("post_id") or data.get("thread_id")
+            return {"ok": True, "id": post_id or f"unknown-{int(time.time())}"}
+        except Exception as e:
+            logging.error("發送文字貼文失敗: %s", e)
+            return {"ok": False, "error": str(e)}
+
+    attached_media = [{"media_fbid": m} for m in media_fbids]
+    payload = {"message": content, "attached_media": attached_media}
+    try:
+        resp = requests.post(posts_endpoint, json=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+        if resp.status_code >= 400:
+            try:
+                logging.error("post_with_media error: %s", resp.json())
+            except Exception:
+                logging.error("post_with_media error: %s", resp.text)
+            resp.raise_for_status()
+        data = resp.json() if resp.content else {}
+        post_id = data.get("id") or data.get("post_id") or data.get("thread_id")
+        return {"ok": True, "id": post_id or f"unknown-{int(time.time())}"}
+    except Exception as e:
+        logging.error("發送圖片貼文失敗: %s", e)
+        return {"ok": False, "error": str(e)}
 
 # ---------- warnings feed processing (with surge detection) ----------
 def process_warnings_feed(warnings_url):
