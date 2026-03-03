@@ -2,8 +2,8 @@ name: Taiwan Weather Bot
 
 on:
   schedule:
-    - cron: '*/5 * * * *'  # 每 5 分鐘自動執行一次
-  workflow_dispatch:        # 讓你可以手動按按鈕執行
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -24,7 +24,6 @@ jobs:
         env:
           THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
           THREADS_USER_ID: ${{ secrets.THREADS_USER_ID }}
-          THREADS_API_ENDPOINT: "https://graph.threads.net/v1.0/posts"
           CWA_API_KEY: ${{ secrets.CWA_API_KEY }}
         run: python main.py
 
