@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-main.py (改良版)
-已修正發文流程以符合 Threads Graph API 的常見欄位與媒體上傳流程：
-- 純文字貼文使用 "message"
-- 圖片貼文先上傳到 /media 取得 media_fbid，再在 /posts 使用 attached_media
-請在環境變數提供 THREADS_API_ENDPOINT / THREADS_ACCESS_TOKEN / THREADS_USER_ID
+main.py (整合版)
+- 讀取中央氣象署 OPML / RSS，處理天氣、警特報、地震等
+- 發文流程已改為符合 Threads Graph API 常見規格：
+  * 純文字貼文使用 "message"
+  * 圖片貼文先上傳到 /{user_id}/media 取得 media_fbid，再在 /{user_id}/posts 使用 attached_media
+請在環境變數提供 THREADS_ACCESS_TOKEN 與 THREADS_USER_ID
 """
 
 import os
@@ -31,9 +32,8 @@ MAX_SINGLE_POST_CHARS = int(os.getenv("MAX_SINGLE_POST_CHARS", "500"))
 USER_TIMEZONE = timezone(timedelta(hours=8))
 
 # Threads API config (set these in your environment)
-# Default endpoint for posts (can be overridden)
-THREADS_API_ENDPOINT = os.getenv("THREADS_API_ENDPOINT", "https://graph.threads.net/v1.0/posts")
-# Media upload endpoint base (we'll derive from posts endpoint host)
+# THREADS_API_ENDPOINT can be left default; we will use per-user endpoints for media/posts
+THREADS_API_ENDPOINT = os.getenv("THREADS_API_ENDPOINT", "https://graph.threads.net/v1.0")
 THREADS_ACCESS_TOKEN = os.getenv("THREADS_ACCESS_TOKEN", "")
 THREADS_USER_ID = os.getenv("THREADS_USER_ID", "")
 
@@ -78,7 +78,7 @@ def save_json(path, data):
 posted_records = load_json(RECORD_FILE, {"warnings": {}, "posts": {}})
 greeting_state = load_json(GREETING_STATE_FILE, {"morning": 0, "noon": 0, "night": 0, "surge": 0})
 
-# ---------- OPML / RSS helpers (unchanged) ----------
+# ---------- OPML / RSS helpers ----------
 def load_opml(opml_path_or_url):
     try:
         if opml_path_or_url.startswith("http://") or opml_path_or_url.startswith("https://"):
@@ -124,7 +124,7 @@ def get_items_from_rss(root):
         return []
     return channel.findall("item")
 
-# ---------- description segmentation / extraction (unchanged) ----------
+# ---------- description segmentation ----------
 SEGMENT_HEADERS = ["今日白天", "今晚明晨", "明日白天", "今日", "今晚", "明日"]
 
 def split_description_into_segments(description_html):
@@ -166,6 +166,7 @@ def choose_segment_by_time(segments, now=None):
                 return key, segments[key]
     return "full", segments.get("full", "")
 
+# ---------- extract temp and rain ----------
 TEMP_RAIN_PATTERN = re.compile(
     r"(?P<city>[\u4e00-\u9fff\w\s\(\)]+)[：:]\s*(?P<temp_low>\d{1,2})\s*[-~]\s*(?P<temp_high>\d{1,2})\s*°?C.*?降雨機率[：:]\s*(?P<rain>\d{1,3})\s*%?"
 )
@@ -222,47 +223,33 @@ def pick_greeting(kind=None, now=None):
     save_json(GREETING_STATE_FILE, greeting_state)
     return greeting
 
-# ---------- Threads API helpers (改良) ----------
-def _get_api_host_from_posts_endpoint():
-    """
-    從 THREADS_API_ENDPOINT 推導出 media endpoint base。
-    例如 posts endpoint 為 https://graph.threads.net/v1.0/posts，
-    則 media endpoint base 為 https://graph.threads.net/v1.0
-    """
-    try:
-        parts = THREADS_API_ENDPOINT.split("/")
-        # remove trailing 'posts' or similar
-        if parts[-1] == "" or parts[-1].lower().startswith("posts"):
-            base = "/".join(parts[:-1])
-        else:
-            base = "/".join(parts[:-1])
-        if base.endswith("/"):
-            base = base[:-1]
-        return base
-    except Exception:
-        return "https://graph.threads.net/v1.0"
+# ---------- Threads API helpers (正確流程) ----------
+def _user_media_endpoint():
+    """回傳 /{user_id}/media endpoint"""
+    return f"{THREADS_API_ENDPOINT.rstrip('/')}/{THREADS_USER_ID}/media"
+
+def _user_posts_endpoint():
+    """回傳 /{user_id}/posts endpoint"""
+    return f"{THREADS_API_ENDPOINT.rstrip('/')}/{THREADS_USER_ID}/posts"
 
 def upload_media(image_url):
     """
-    將圖片 URL 上傳到 Threads 的 media endpoint，回傳 media_fbid（或 None）。
-    注意：不同 API 版本欄位名稱可能不同（image_url / url / file），
-    若你的 API 要求 multipart/form-data 或直接上傳二進位，需依文件調整。
-    這裡使用最常見的簡單 POST data: {"image_url": "<url>"} 的方式嘗試。
+    將圖片 URL 上傳到 Threads 的 /{user_id}/media endpoint，回傳 media_fbid（或 None）。
+    注意：若官方要求 multipart/form-data 或上傳二進位，需改成先下載再上傳檔案。
     """
-    if not THREADS_ACCESS_TOKEN:
-        logging.error("沒有 THREADS_ACCESS_TOKEN，無法上傳媒體")
+    if not THREADS_ACCESS_TOKEN or not THREADS_USER_ID:
+        logging.error("沒有 THREADS_ACCESS_TOKEN 或 THREADS_USER_ID，無法上傳媒體")
         return None
 
-    base = _get_api_host_from_posts_endpoint()
-    media_endpoint = f"{base}/media"
+    media_endpoint = _user_media_endpoint()
     headers = {"Authorization": f"Bearer {THREADS_ACCESS_TOKEN}"}
+    # 這裡嘗試以最常見的 image_url 欄位上傳；若 API 要求不同，請依文件調整
     payload = {"image_url": image_url}
 
     try:
         resp = requests.post(media_endpoint, data=payload, headers=headers, timeout=20)
         resp.raise_for_status()
         data = resp.json() if resp.content else {}
-        # 常見回傳欄位可能是 "id" 或 "media_fbid"
         media_id = data.get("id") or data.get("media_fbid") or data.get("fbid")
         if not media_id:
             logging.error("上傳媒體成功但回傳沒有 media id: %s", data)
@@ -274,24 +261,20 @@ def upload_media(image_url):
 
 def post_to_api(content, attachments=None):
     """
-    依官方流程發文：
-    - 若沒有 endpoint 或 token，回傳 mock（方便本地測試）
-    - 若只有文字：直接 POST 到 /posts，使用 message 欄位
-    - 若有 attachments（圖片 URL list）：先上傳每張圖片取得 media_fbid，再在 /posts 使用 attached_media
-    回傳 dict: {"ok": True/False, "id": ..., "error": ...}
+    發文流程：
+    - 若未設定 token 或 user id，回傳 mock（方便本地測試）
+    - 純文字：POST /{user_id}/posts，使用 message 欄位
+    - 圖片：先上傳每張圖片到 /{user_id}/media 取得 media_fbid，再在 /{user_id}/posts 使用 attached_media
     """
-    media_urls = attachments if attachments else None
-
-    if not THREADS_API_ENDPOINT or not THREADS_ACCESS_TOKEN:
-        logging.info("THREADS_API_ENDPOINT or THREADS_ACCESS_TOKEN not set — using mock post.")
+    if not THREADS_ACCESS_TOKEN or not THREADS_USER_ID:
+        logging.info("THREADS_ACCESS_TOKEN 或 THREADS_USER_ID 未設定 — 使用 mock 發文")
         return {"ok": True, "id": f"mock-{int(time.time())}"}
 
+    post_url = _user_posts_endpoint()
     headers = {"Authorization": f"Bearer {THREADS_ACCESS_TOKEN}"}
-    post_url = THREADS_API_ENDPOINT
 
-    # Build payload
-    if not media_urls:
-        # 文字貼文：使用 message 欄位（部分 API 版本可能接受 caption）
+    # 沒有媒體，直接文字貼文
+    if not attachments:
         payload = {"message": content}
         try:
             resp = requests.post(post_url, data=payload, headers=headers, timeout=15)
@@ -300,48 +283,47 @@ def post_to_api(content, attachments=None):
             post_id = data.get("id") or data.get("post_id") or data.get("thread_id")
             return {"ok": True, "id": post_id or f"unknown-{int(time.time())}"}
         except Exception as e:
-            logging.error("發送到 Threads API 失敗: %s", e)
+            logging.error("發送文字貼文失敗: %s", e)
             return {"ok": False, "error": str(e)}
-    else:
-        # 有媒體：先上傳每張圖片取得 media id
-        media_fbids = []
-        for url in media_urls:
-            if not url:
-                continue
-            media_id = upload_media(url)
-            if media_id:
-                media_fbids.append(media_id)
-            else:
-                logging.warning("某張媒體上傳失敗，將跳過: %s", url)
 
-        if not media_fbids:
-            logging.error("所有媒體上傳皆失敗，改以純文字發文")
-            # fallback to text-only post
-            payload = {"message": content}
-            try:
-                resp = requests.post(post_url, data=payload, headers=headers, timeout=15)
-                resp.raise_for_status()
-                data = resp.json() if resp.content else {}
-                post_id = data.get("id") or data.get("post_id") or data.get("thread_id")
-                return {"ok": True, "id": post_id or f"unknown-{int(time.time())}"}
-            except Exception as e:
-                logging.error("發送到 Threads API 失敗: %s", e)
-                return {"ok": False, "error": str(e)}
+    # 有媒體：先上傳
+    media_fbids = []
+    for url in attachments:
+        if not url:
+            continue
+        media_id = upload_media(url)
+        if media_id:
+            media_fbids.append(media_id)
+        else:
+            logging.warning("某張媒體上傳失敗，將跳過: %s", url)
 
-        # 組成 attached_media 格式
-        attached_media = [{"media_fbid": m} for m in media_fbids]
-        payload = {"message": content, "attached_media": attached_media}
+    if not media_fbids:
+        logging.error("所有媒體上傳皆失敗，改以純文字發文")
+        # fallback to text-only post
+        payload = {"message": content}
         try:
-            resp = requests.post(post_url, json=payload, headers=headers, timeout=20)
+            resp = requests.post(post_url, data=payload, headers=headers, timeout=15)
             resp.raise_for_status()
             data = resp.json() if resp.content else {}
             post_id = data.get("id") or data.get("post_id") or data.get("thread_id")
             return {"ok": True, "id": post_id or f"unknown-{int(time.time())}"}
         except Exception as e:
-            logging.error("發送到 Threads API 失敗: %s", e)
+            logging.error("發送文字貼文失敗: %s", e)
             return {"ok": False, "error": str(e)}
 
-# ---------- warnings feed processing (unchanged except using new post_to_api) ----------
+    attached_media = [{"media_fbid": m} for m in media_fbids]
+    payload = {"message": content, "attached_media": attached_media}
+    try:
+        resp = requests.post(post_url, json=payload, headers=headers, timeout=20)
+        resp.raise_for_status()
+        data = resp.json() if resp.content else {}
+        post_id = data.get("id") or data.get("post_id") or data.get("thread_id")
+        return {"ok": True, "id": post_id or f"unknown-{int(time.time())}"}
+    except Exception as e:
+        logging.error("發送圖片貼文失敗: %s", e)
+        return {"ok": False, "error": str(e)}
+
+# ---------- warnings feed processing (with surge detection) ----------
 def process_warnings_feed(warnings_url):
     try:
         root = fetch_rss_xml(warnings_url)
@@ -399,7 +381,7 @@ def process_warnings_feed(warnings_url):
             logging.error("處理某筆警報時發生例外: %s", e)
             continue
 
-# ---------- earthquake item processing (unchanged except using new post_to_api) ----------
+# ---------- earthquake item processing ----------
 def process_earthquake_item(item):
     title = item.findtext("title", "").strip()
     pubDate = item.findtext("pubDate", "").strip()
@@ -437,7 +419,7 @@ def process_earthquake_item(item):
     else:
         logging.error("發佈地震失敗，但已更新紀錄: %s", title)
 
-# ---------- weather pipeline (unchanged except using new post_to_api) ----------
+# ---------- weather pipeline ----------
 def run_weather_pipeline(opml_path):
     opml = load_opml(opml_path)
     forecast_map = opml.get("今明天氣預報", {})
